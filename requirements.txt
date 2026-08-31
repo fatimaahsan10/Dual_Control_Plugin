@@ -1,0 +1,13 @@
+# Runtime dependencies for PYTHON/wizard/app.py (Streamlit Community Cloud
+# deploy). Streamlit Cloud installs this automatically before launching the
+# app -- it does NOT run our local "pip install -e ." step from PYTHON/
+# (see PYTHON/pyproject.toml / PLUGIN_GUIDE.md), so this file is what makes
+# the hosted environment self-sufficient. Kept to what app.py's own import
+# graph actually needs (core/ddp_solver + extensions/dual_control are
+# numpy-only on this path); scipy/scikit-learn are only used by the
+# SINDy/notebook side of the project, not the wizard app.
+streamlit>=1.61
+numpy>=2.5
+pandas>=3.0
+sympy>=1.14
+matplotlib>=3.11
