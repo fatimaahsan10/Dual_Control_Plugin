@@ -35,6 +35,21 @@ Session-state keys used (see `_init_state`):
 
 from __future__ import annotations
 
+import sys
+from pathlib import Path
+
+# Streamlit Community Cloud runs `streamlit run PYTHON/wizard/app.py` directly,
+# without our local `pip install -e .` step (see PYTHON/pyproject.toml), and
+# Streamlit only puts this file's own directory (wizard/) on sys.path -- not
+# its parent PYTHON/, which is what the `wizard.*`/`core.*`/`extensions.*`/
+# `applications.*` absolute imports below actually need. Adding PYTHON/ here
+# makes the imports resolve regardless of how/where this script is launched
+# from, on top of (not instead of) the editable install local dev already
+# uses -- harmless if PYTHON/ is already importable.
+_PYTHON_DIR = str(Path(__file__).resolve().parent.parent)
+if _PYTHON_DIR not in sys.path:
+    sys.path.insert(0, _PYTHON_DIR)
+
 import json
 
 import numpy as np
