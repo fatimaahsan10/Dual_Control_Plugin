@@ -1,0 +1,146 @@
+{
+  "name": "2 Link Robotic Arm",
+  "description": "This is a 2 link robotic arm where a gripper moves the mass towards the specific target. The second mass is unknown to the controller. The algorithm learns the unknown mass and as well as controls the arm. ",
+  "dt": 0.05,
+  "n_sessions": 20,
+  "states": [
+    {
+      "name": "q1",
+      "label": "joint 1 angle",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 0.0001
+    },
+    {
+      "name": "q2",
+      "label": "joint 2 angle",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 0.0001
+    },
+    {
+      "name": "w1",
+      "label": "joint 1 angular velocity",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 0.05
+    },
+    {
+      "name": "w2",
+      "label": "joint 2 angular velocity",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 0.05
+    }
+  ],
+  "actions": [
+    {
+      "name": "tau1",
+      "label": "torque of joint 1",
+      "min": -30.0,
+      "max": 30.0
+    },
+    {
+      "name": "tau2",
+      "label": "torque of joint 2",
+      "min": -15.0,
+      "max": 15.0
+    }
+  ],
+  "parameters": [
+    {
+      "name": "m2",
+      "label": "mass m2",
+      "prior_guess": 0.3,
+      "prior_variance": 0.25,
+      "process_noise": 0.01,
+      "true_value": 1.0
+    }
+  ],
+  "constants": [
+    {
+      "name": "l1",
+      "value": 1.0
+    },
+    {
+      "name": "l2",
+      "value": 1.0
+    },
+    {
+      "name": "lc1",
+      "value": 0.5
+    },
+    {
+      "name": "lc2",
+      "value": 0.5
+    },
+    {
+      "name": "m1",
+      "value": 1.0
+    },
+    {
+      "name": "I1",
+      "value": 0.1
+    },
+    {
+      "name": "I2",
+      "value": 0.1
+    },
+    {
+      "name": "g",
+      "value": 9.81
+    },
+    {
+      "name": "fv1",
+      "value": 0.5
+    },
+    {
+      "name": "fv2",
+      "value": 0.5
+    }
+  ],
+  "dynamics": {
+    "q1": "w1",
+    "q2": "w2",
+    "w1": "((m2*lc2^2 + I2)*(tau1 + m2*l1*lc2*sin(q2)*w1*w2 + m2*l1*lc2*sin(q2)*(w1 + w2)*w2 - ((m1*lc1 + m2*l1)*g*cos(q1) + m2*lc2*g*cos(q1 + q2)) - fv1*w1) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)*(tau2 - m2*l1*lc2*sin(q2)*w1^2 - m2*lc2*g*cos(q1 + q2) - fv2*w2)) / ((m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(m2*lc2^2 + I2) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)^2)",
+    "w2": "(-(m2*(lc2^2 + l1*lc2*cos(q2)) + I2)*(tau1 + m2*l1*lc2*sin(q2)*w1*w2 + m2*l1*lc2*sin(q2)*(w1 + w2)*w2 - ((m1*lc1 + m2*l1)*g*cos(q1) + m2*lc2*g*cos(q1 + q2)) - fv1*w1) + (m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(tau2 - m2*l1*lc2*sin(q2)*w1^2 - m2*lc2*g*cos(q1 + q2) - fv2*w2)) / ((m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(m2*lc2^2 + I2) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)^2)"
+  },
+  "measurement": [
+    {
+      "name": "q1",
+      "expression": "q1",
+      "noise_scale": 0.02
+    },
+    {
+      "name": "q2",
+      "expression": "q2",
+      "noise_scale": 0.02
+    },
+    {
+      "name": "w1",
+      "expression": "w1",
+      "noise_scale": 0.05
+    },
+    {
+      "name": "w2",
+      "expression": "w2",
+      "noise_scale": 0.05
+    }
+  ],
+  "cost": {
+    "running": "10*(q1-1.0472)^2 + 10*(q2+0.7854)^2 + w1^2 + w2^2 + 0.01*tau1^2 + 0.01*tau2^2",
+    "terminal": "200*(q1-1.0472)^2 + 200*(q2+0.7854)^2 + 50*w1^2 + 50*w2^2"
+  },
+  "solver": {
+    "u_lim_method": 1,
+    "reg_type": 1,
+    "max_du_iterations": 100,
+    "first_run_max_du_iterations": 150,
+    "seed": 0
+  },
+  "schema_version": 1
+}

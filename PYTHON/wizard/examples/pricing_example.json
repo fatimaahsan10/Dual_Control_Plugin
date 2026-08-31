@@ -1,0 +1,74 @@
+{
+  "name": "pricing_example",
+  "description": "One quantity ('demand') relaxes toward a level set by one controlled action ('price') and one unknown sensitivity the controller learns online. A single state, single action, single unknown parameter -- the simplest working example.",
+  "dt": 1.0,
+  "n_sessions": 15,
+  "states": [
+    {
+      "name": "demand",
+      "label": "Demand",
+      "initial_value": 70.0,
+      "min": 0.0,
+      "max": null,
+      "process_noise": 1.0
+    }
+  ],
+  "actions": [
+    {
+      "name": "price",
+      "label": "Price",
+      "min": 10.0,
+      "max": 45.0
+    }
+  ],
+  "parameters": [
+    {
+      "name": "sensitivity",
+      "label": "Price sensitivity",
+      "prior_guess": 0.5,
+      "prior_variance": 1.0,
+      "process_noise": 0.05,
+      "true_value": 2.0
+    }
+  ],
+  "constants": [
+    {
+      "name": "intercept",
+      "value": 100.0
+    },
+    {
+      "name": "adjustment_rate",
+      "value": 0.3
+    },
+    {
+      "name": "marginal_cost",
+      "value": 10.0
+    },
+    {
+      "name": "reference_price",
+      "value": 35.0
+    }
+  ],
+  "dynamics": {
+    "demand": "adjustment_rate * (intercept - sensitivity*price - demand)"
+  },
+  "measurement": [
+    {
+      "name": "observed_demand",
+      "expression": "demand",
+      "noise_scale": 1.0
+    }
+  ],
+  "cost": {
+    "running": "-(price - marginal_cost) * (intercept - sensitivity*price) + 0.0001*(price - reference_price)^2",
+    "terminal": "0"
+  },
+  "solver": {
+    "u_lim_method": 1,
+    "reg_type": 1,
+    "max_du_iterations": 60,
+    "first_run_max_du_iterations": 100,
+    "seed": 0
+  },
+  "schema_version": 1
+}

@@ -1,0 +1,118 @@
+{
+  "name": "duopoly_example",
+  "description": "Two quantities, two controlled actions, and four unknown sensitivities (each quantity depends on BOTH actions) -- a structurally different, harder example with cross-terms between the two sides of the system.",
+  "dt": 1.0,
+  "n_sessions": 15,
+  "states": [
+    {
+      "name": "demand_A",
+      "label": "Demand A",
+      "initial_value": 40.0,
+      "min": 0.0,
+      "max": null,
+      "process_noise": 1.0
+    },
+    {
+      "name": "demand_B",
+      "label": "Demand B",
+      "initial_value": 40.0,
+      "min": 0.0,
+      "max": null,
+      "process_noise": 1.0
+    }
+  ],
+  "actions": [
+    {
+      "name": "price_A",
+      "label": "Price A",
+      "min": 0.0,
+      "max": 45.0
+    },
+    {
+      "name": "price_B",
+      "label": "Price B",
+      "min": 0.0,
+      "max": 45.0
+    }
+  ],
+  "parameters": [
+    {
+      "name": "sens_AA",
+      "label": "A's sensitivity to price A",
+      "prior_guess": 1.0,
+      "prior_variance": 1.0,
+      "process_noise": 0.05,
+      "true_value": 2.0
+    },
+    {
+      "name": "sens_AB",
+      "label": "A's sensitivity to price B",
+      "prior_guess": 0.1,
+      "prior_variance": 1.0,
+      "process_noise": 0.05,
+      "true_value": 0.3
+    },
+    {
+      "name": "sens_BA",
+      "label": "B's sensitivity to price A",
+      "prior_guess": 0.1,
+      "prior_variance": 1.0,
+      "process_noise": 0.05,
+      "true_value": 0.25
+    },
+    {
+      "name": "sens_BB",
+      "label": "B's sensitivity to price B",
+      "prior_guess": 1.0,
+      "prior_variance": 1.0,
+      "process_noise": 0.05,
+      "true_value": 1.8
+    }
+  ],
+  "constants": [
+    {
+      "name": "intercept_A",
+      "value": 80.0
+    },
+    {
+      "name": "intercept_B",
+      "value": 80.0
+    },
+    {
+      "name": "adjustment_rate_A",
+      "value": 0.3
+    },
+    {
+      "name": "adjustment_rate_B",
+      "value": 0.3
+    }
+  ],
+  "dynamics": {
+    "demand_A": "adjustment_rate_A * (intercept_A - sens_AA*price_A + sens_AB*price_B - demand_A)",
+    "demand_B": "adjustment_rate_B * (intercept_B - sens_BB*price_B + sens_BA*price_A - demand_B)"
+  },
+  "measurement": [
+    {
+      "name": "observed_demand_A",
+      "expression": "demand_A",
+      "noise_scale": 1.0
+    },
+    {
+      "name": "observed_demand_B",
+      "expression": "demand_B",
+      "noise_scale": 1.0
+    }
+  ],
+  "cost": {
+    "running": "-(price_A)*(intercept_A - sens_AA*price_A + sens_AB*price_B) -(price_B)*(intercept_B - sens_BB*price_B + sens_BA*price_A)",
+    "terminal": "0"
+  },
+  "solver": {
+    "u_lim_method": 1,
+    "reg_type": 1,
+    "max_du_iterations": 60,
+    "first_run_max_du_iterations": 100,
+    "seed": 0
+  },
+  "schema_version": 1
+}
