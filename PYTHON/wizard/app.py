@@ -89,6 +89,24 @@ def _init_state() -> None:
     st.session_state.setdefault("solver_report", None)
 
 
+# Step-2..7 tables that hold their own live edit buffer in session_state
+# (see `_reset_editor_buffers` and each render_* function below for why).
+_EDITOR_TABLE_NAMES = ["states", "actions", "parameters", "constants", "measurement"]
+
+
+def _reset_editor_buffers() -> None:
+    """Drop every data_editor's live buffer AND its own widget-state key.
+
+    Must be called any time `st.session_state.config` is replaced with a
+    *different* model (new/loaded/reset) -- otherwise a table's buffer
+    (see render_states et al.) would keep showing the PREVIOUS model's
+    rows instead of the newly-loaded one's, since that buffer is normally
+    only (re)built the first time a step is visited per session."""
+    for name in _EDITOR_TABLE_NAMES:
+        st.session_state.pop(f"{name}_df", None)
+        st.session_state.pop(f"{name}_editor", None)
+
+
 def _config_signature(cfg: ModelConfig) -> str:
     return json.dumps(cfg.to_dict(), sort_keys=True, default=str)
 
@@ -146,10 +164,20 @@ def render_start() -> None:
         "Build and test a control/estimation model through guided "
         "questions -- states, actions, unknown parameters, dynamics, "
         "measurement, and cost -- with no code required.")
+    st.warning(
+        "On the hosted (Streamlit Community Cloud) version of this app, "
+        "'Save' only writes to that container's temporary disk -- it can "
+        "be wiped by a restart (inactivity, redeploy, or a resource "
+        "limit) and won't show up under 'Load a saved model' afterwards. "
+        "**Use 'Download model file' (step 10) to save a copy to your "
+        "own computer, and 'Upload a model file' below to resume from "
+        "it** -- that's the only way progress reliably survives a "
+        "restart on the hosted deployment.", icon="⚠️")
 
     choice = st.radio(
         "What would you like to do?",
-        ["Start a new model", "Load a saved model", "Load an example"],
+        ["Start a new model", "Load a saved model", "Upload a model file",
+         "Load an example"],
         key="start_choice")
 
     if choice == "Start a new model":
@@ -161,13 +189,16 @@ def render_start() -> None:
                 st.session_state.config = ModelConfig(name=name.strip())
                 st.session_state.validation_report = None
                 st.session_state.solver_report = None
+                _reset_editor_buffers()
                 _goto(0)
                 st.rerun()
 
     elif choice == "Load a saved model":
         names = list_models()
         if not names:
-            st.info("No saved models yet.")
+            st.info("No saved models yet on this container's disk. If you "
+                     "saved one earlier and it's gone, the container "
+                     "likely restarted -- see the warning above.")
         else:
             sel = st.selectbox("Choose a saved model:", names, key="load_select")
             if st.button("Load", key="load_btn"):
@@ -175,10 +206,33 @@ def render_start() -> None:
                     st.session_state.config = load_model(sel)
                     st.session_state.validation_report = None
                     st.session_state.solver_report = None
+                    _reset_editor_buffers()
                     _goto(0)
                     st.rerun()
                 except StorageError as e:
                     st.error(e.message)
+
+    elif choice == "Upload a model file":
+        uploaded = st.file_uploader(
+            "Choose a model .json file you previously downloaded:",
+            type="json", key="upload_model_file")
+        if uploaded is not None and st.button("Load uploaded file", key="load_uploaded_btn"):
+            try:
+                data = json.loads(uploaded.getvalue().decode("utf-8"))
+                st.session_state.config = ModelConfig.from_dict(data)
+                st.session_state.validation_report = None
+                st.session_state.solver_report = None
+                _reset_editor_buffers()
+                _goto(0)
+                st.rerun()
+            except json.JSONDecodeError as e:
+                st.error(f"That file isn't valid JSON ({e}).")
+            except (TypeError, ValueError, KeyError) as e:
+                st.error(
+                    f"That file has missing or mismatched fields "
+                    f"({type(e).__name__}: {e}) -- it may be from an "
+                    f"incompatible version or have been hand-edited "
+                    f"incorrectly.")
 
     else:
         examples = list_examples()
@@ -193,6 +247,7 @@ def render_start() -> None:
                     st.session_state.config = load_model_from_path(path)
                     st.session_state.validation_report = None
                     st.session_state.solver_report = None
+                    _reset_editor_buffers()
                     _goto(0)
                     st.rerun()
                 except StorageError as e:
@@ -225,16 +280,18 @@ def render_states(cfg: ModelConfig) -> None:
     st.header("2. States")
     st.write("How many quantities does your system keep track of over time?")
 
-    df = pd.DataFrame({
-        "name": pd.Series([s.name for s in cfg.states], dtype="object"),
-        "label": pd.Series([s.label for s in cfg.states], dtype="object"),
-        "initial_value": pd.Series([s.initial_value for s in cfg.states], dtype="float64"),
-        "min": pd.Series([s.min for s in cfg.states], dtype="float64"),
-        "max": pd.Series([s.max for s in cfg.states], dtype="float64"),
-        "process_noise": pd.Series([s.process_noise for s in cfg.states], dtype="float64"),
-    })
+    if "states_df" not in st.session_state:
+        st.session_state.states_df = pd.DataFrame({
+            "name": pd.Series([s.name for s in cfg.states], dtype="object"),
+            "label": pd.Series([s.label for s in cfg.states], dtype="object"),
+            "initial_value": pd.Series([s.initial_value for s in cfg.states], dtype="float64"),
+            "min": pd.Series([s.min for s in cfg.states], dtype="float64"),
+            "max": pd.Series([s.max for s in cfg.states], dtype="float64"),
+            "process_noise": pd.Series([s.process_noise for s in cfg.states], dtype="float64"),
+        })
     edited = st.data_editor(
-        df, num_rows="dynamic", key="states_editor", use_container_width=True,
+        st.session_state.states_df, num_rows="dynamic", key="states_editor",
+        use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Name", help="e.g. x1 or demand"),
             "label": st.column_config.TextColumn("Label (optional)"),
@@ -245,6 +302,7 @@ def render_states(cfg: ModelConfig) -> None:
                 "Process noise scale", min_value=0.0,
                 help="How much this quantity drifts randomly each step."),
         })
+    st.session_state.states_df = edited
 
     new_states = []
     for _, row in edited.iterrows():
@@ -271,20 +329,23 @@ def render_actions(cfg: ModelConfig) -> None:
     st.header("3. Actions")
     st.write("How many things can you choose or control at each step?")
 
-    df = pd.DataFrame({
-        "name": pd.Series([a.name for a in cfg.actions], dtype="object"),
-        "label": pd.Series([a.label for a in cfg.actions], dtype="object"),
-        "min": pd.Series([a.min for a in cfg.actions], dtype="float64"),
-        "max": pd.Series([a.max for a in cfg.actions], dtype="float64"),
-    })
+    if "actions_df" not in st.session_state:
+        st.session_state.actions_df = pd.DataFrame({
+            "name": pd.Series([a.name for a in cfg.actions], dtype="object"),
+            "label": pd.Series([a.label for a in cfg.actions], dtype="object"),
+            "min": pd.Series([a.min for a in cfg.actions], dtype="float64"),
+            "max": pd.Series([a.max for a in cfg.actions], dtype="float64"),
+        })
     edited = st.data_editor(
-        df, num_rows="dynamic", key="actions_editor", use_container_width=True,
+        st.session_state.actions_df, num_rows="dynamic", key="actions_editor",
+        use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Name", help="e.g. u1 or price"),
             "label": st.column_config.TextColumn("Label (optional)"),
             "min": st.column_config.NumberColumn("Minimum allowed value (required)"),
             "max": st.column_config.NumberColumn("Maximum allowed value (required)"),
         })
+    st.session_state.actions_df = edited
 
     new_actions = []
     for _, row in edited.iterrows():
@@ -311,16 +372,18 @@ def render_parameters(cfg: ModelConfig) -> None:
         "know, but want the controller to learn from data as it runs? "
         "It's fine to have none.")
 
-    df = pd.DataFrame({
-        "name": pd.Series([p.name for p in cfg.parameters], dtype="object"),
-        "label": pd.Series([p.label for p in cfg.parameters], dtype="object"),
-        "prior_guess": pd.Series([p.prior_guess for p in cfg.parameters], dtype="float64"),
-        "prior_variance": pd.Series([p.prior_variance for p in cfg.parameters], dtype="float64"),
-        "process_noise": pd.Series([p.process_noise for p in cfg.parameters], dtype="float64"),
-        "true_value": pd.Series([p.true_value for p in cfg.parameters], dtype="float64"),
-    })
+    if "parameters_df" not in st.session_state:
+        st.session_state.parameters_df = pd.DataFrame({
+            "name": pd.Series([p.name for p in cfg.parameters], dtype="object"),
+            "label": pd.Series([p.label for p in cfg.parameters], dtype="object"),
+            "prior_guess": pd.Series([p.prior_guess for p in cfg.parameters], dtype="float64"),
+            "prior_variance": pd.Series([p.prior_variance for p in cfg.parameters], dtype="float64"),
+            "process_noise": pd.Series([p.process_noise for p in cfg.parameters], dtype="float64"),
+            "true_value": pd.Series([p.true_value for p in cfg.parameters], dtype="float64"),
+        })
     edited = st.data_editor(
-        df, num_rows="dynamic", key="parameters_editor", use_container_width=True,
+        st.session_state.parameters_df, num_rows="dynamic", key="parameters_editor",
+        use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Name"),
             "label": st.column_config.TextColumn("Label (optional)"),
@@ -337,6 +400,7 @@ def render_parameters(cfg: ModelConfig) -> None:
                      "not on real data -- used to check whether the "
                      "controller learns correctly."),
         })
+    st.session_state.parameters_df = edited
 
     new_params = []
     for _, row in edited.iterrows():
@@ -360,16 +424,19 @@ def render_constants(cfg: ModelConfig) -> None:
     st.header("5. Constants")
     st.write("Any other fixed, known numbers your equations need?")
 
-    df = pd.DataFrame({
-        "name": pd.Series([c.name for c in cfg.constants], dtype="object"),
-        "value": pd.Series([c.value for c in cfg.constants], dtype="float64"),
-    })
+    if "constants_df" not in st.session_state:
+        st.session_state.constants_df = pd.DataFrame({
+            "name": pd.Series([c.name for c in cfg.constants], dtype="object"),
+            "value": pd.Series([c.value for c in cfg.constants], dtype="float64"),
+        })
     edited = st.data_editor(
-        df, num_rows="dynamic", key="constants_editor", use_container_width=True,
+        st.session_state.constants_df, num_rows="dynamic", key="constants_editor",
+        use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Name"),
             "value": st.column_config.NumberColumn("Value"),
         })
+    st.session_state.constants_df = edited
 
     new_constants = []
     for _, row in edited.iterrows():
@@ -417,13 +484,15 @@ def render_measurement(cfg: ModelConfig) -> None:
         f"Known names: {', '.join(all_names) or '(none defined yet)'}. "
         f"Tip: to observe a state directly, just write its name.")
 
-    df = pd.DataFrame({
-        "name": pd.Series([m.name for m in cfg.measurement], dtype="object"),
-        "expression": pd.Series([m.expression for m in cfg.measurement], dtype="object"),
-        "noise_scale": pd.Series([m.noise_scale for m in cfg.measurement], dtype="float64"),
-    })
+    if "measurement_df" not in st.session_state:
+        st.session_state.measurement_df = pd.DataFrame({
+            "name": pd.Series([m.name for m in cfg.measurement], dtype="object"),
+            "expression": pd.Series([m.expression for m in cfg.measurement], dtype="object"),
+            "noise_scale": pd.Series([m.noise_scale for m in cfg.measurement], dtype="float64"),
+        })
     edited = st.data_editor(
-        df, num_rows="dynamic", key="measurement_editor", use_container_width=True,
+        st.session_state.measurement_df, num_rows="dynamic", key="measurement_editor",
+        use_container_width=True,
         column_config={
             "name": st.column_config.TextColumn("Output name"),
             "expression": st.column_config.TextColumn(
@@ -431,6 +500,7 @@ def render_measurement(cfg: ModelConfig) -> None:
             "noise_scale": st.column_config.NumberColumn(
                 "Measurement noise scale", min_value=0.0),
         })
+    st.session_state.measurement_df = edited
 
     new_measurement = []
     for _, row in edited.iterrows():
@@ -546,7 +616,14 @@ def render_review(cfg: ModelConfig) -> None:
             st.caption(fname)
             st.code(src, language="python")
 
-    if st.button("Save model", key="save_btn"):
+    st.download_button(
+        "Download model file (recommended -- survives a server restart)",
+        json.dumps(cfg.to_dict(), indent=2),
+        file_name=f"{cfg.name or 'model'}.json", mime="application/json",
+        key="download_model_btn")
+
+    if st.button("Save model to this container (temporary, see warning above)",
+                 key="save_btn"):
         try:
             path = save_model(cfg)
             st.success(f"Saved to {path.name}")
@@ -680,7 +757,12 @@ def main() -> None:
             st.radio("Steps", options=list(range(len(STEP_NAMES))),
                        format_func=lambda i: STEP_NAMES[i], key="step_idx")
             st.divider()
-            if st.button("Save now", key="sidebar_save"):
+            st.download_button(
+                "Download model file", json.dumps(cfg.to_dict(), indent=2),
+                file_name=f"{cfg.name or 'model'}.json", mime="application/json",
+                key="sidebar_download")
+            if st.button("Save now (temporary, this container only)",
+                         key="sidebar_save"):
                 try:
                     path = save_model(cfg)
                     st.success(f"Saved to {path.name}")
@@ -690,6 +772,7 @@ def main() -> None:
                 st.session_state.config = None
                 st.session_state.validation_report = None
                 st.session_state.solver_report = None
+                _reset_editor_buffers()
                 _goto(0)
                 st.rerun()
 
