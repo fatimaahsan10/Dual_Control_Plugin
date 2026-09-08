@@ -47,7 +47,7 @@ from applications.robot_arm_2link.cost import cost
 from applications.robot_arm_2link.dynamics import dynamics
 from applications.robot_arm_2link.measurement import measurement
 
-N_SESSIONS = 40
+N_SESSIONS = 20
 DT = 0.05  # s -- 2.0 s total reach horizon
 
 TAU1_LIM, TAU2_LIM = 30.0, 15.0  # N*m -- see module docstring's worst-case check
