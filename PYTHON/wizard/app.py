@@ -51,6 +51,7 @@ if _PYTHON_DIR not in sys.path:
     sys.path.insert(0, _PYTHON_DIR)
 
 import json
+from dataclasses import MISSING, asdict, dataclass
 
 import numpy as np
 import pandas as pd
@@ -89,22 +90,21 @@ def _init_state() -> None:
     st.session_state.setdefault("solver_report", None)
 
 
-# Step-2..7 tables that hold their own live edit buffer in session_state
-# (see `_reset_editor_buffers` and each render_* function below for why).
-_EDITOR_TABLE_NAMES = ["states", "actions", "parameters", "constants", "measurement"]
+# Step-2..7 tables built with _select_row/_row_form below; each keeps its
+# own "which row is selected" widget key in session_state (see
+# `_reset_row_editor_state`).
+_ROW_TABLE_NAMES = ["states", "actions", "parameters", "constants", "measurement"]
 
 
-def _reset_editor_buffers() -> None:
-    """Drop every data_editor's live buffer AND its own widget-state key.
+def _reset_row_editor_state() -> None:
+    """Drop every table's "which row is selected" widget state.
 
     Must be called any time `st.session_state.config` is replaced with a
-    *different* model (new/loaded/reset) -- otherwise a table's buffer
-    (see render_states et al.) would keep showing the PREVIOUS model's
-    rows instead of the newly-loaded one's, since that buffer is normally
-    only (re)built the first time a step is visited per session."""
-    for name in _EDITOR_TABLE_NAMES:
-        st.session_state.pop(f"{name}_df", None)
-        st.session_state.pop(f"{name}_editor", None)
+    *different* model (new/loaded/reset) -- otherwise a table's selector
+    could keep pointing at an index from the PREVIOUS model instead of
+    resetting to "+ Add new" for the newly-loaded one."""
+    for name in _ROW_TABLE_NAMES:
+        st.session_state.pop(f"{name}_select", None)
 
 
 def _config_signature(cfg: ModelConfig) -> str:
@@ -122,28 +122,6 @@ def _goto(step_idx: int) -> None:
     st.session_state["step_idx"] = step_idx
 
 
-def _nullable_float(value) -> float | None:
-    if value is None:
-        return None
-    try:
-        if pd.isna(value):
-            return None
-    except (TypeError, ValueError):
-        pass
-    return float(value)
-
-
-def _non_empty_str(value) -> str:
-    if value is None:
-        return ""
-    try:
-        if pd.isna(value):
-            return ""
-    except (TypeError, ValueError):
-        pass
-    return str(value)
-
-
 def _show_equation_feedback(text: str, all_names: list[str]) -> None:
     if not text.strip():
         return
@@ -152,6 +130,128 @@ def _show_equation_feedback(text: str, all_names: list[str]) -> None:
         st.success("Looks good.", icon="✅")
     else:
         st.error(msg, icon="⚠️")
+
+
+# ----------------------------------------------------------------------
+# Shared row-list editor for steps 2-5 and 7 (states/actions/parameters/
+# constants/measurement) -- add/edit/delete ONE row at a time via plain
+# widgets (text_input/number_input/selectbox/form), never st.data_editor.
+# st.data_editor's canvas-based cell editor has a real, reproducible
+# upstream bug (streamlit/streamlit#7354, #7749, #7868): pressing Enter
+# right after typing into a cell sometimes silently reverts it instead of
+# saving, even before any Streamlit rerun happens. Clicking away to blur
+# the cell works, Enter does not -- confirmed live on the deployed app,
+# confirmed independent of hosting (it's in Streamlit's bundled frontend
+# code). Plain widgets don't have this bug.
+# ----------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class _Field:
+    """One editable field in a _row_form. `kind` is "text", "float" (a
+    plain required number), or "optional_float" (a number_input that can
+    be left blank, returning None -- for Optional[float] dataclass
+    fields)."""
+    attr: str
+    label: str
+    kind: str
+    min_value: float | None = None
+    help: str | None = None
+
+
+def _select_row(items: list, key_prefix: str) -> int | None:
+    """The "which row to edit, or add new" selector shared by every
+    table step. Returns the selected row's index, or None for "+ Add
+    new" -- index rather than name, so two rows that happen to share a
+    name (only caught at cfg.validate() time, not blocked here) can't
+    collide on the same selection."""
+    def _label(i: int | None) -> str:
+        if i is None:
+            return "+ Add new"
+        name = items[i].name or "(blank)"
+        return f"{i}: {name}"
+
+    return st.selectbox(
+        "Edit existing or add new:", options=[None] + list(range(len(items))),
+        format_func=_label, key=f"{key_prefix}_select")
+
+
+def _row_form(
+    cfg: ModelConfig, items: list, spec_cls: type, fields: list[_Field],
+    key_prefix: str, selected_idx: int | None, *,
+    on_change=None, extra_values: dict | None = None,
+    extra_keys_to_clear: list[str] | None = None,
+) -> None:
+    """Renders the add/edit form for `items[selected_idx]` (or a blank
+    "add new" row if `selected_idx` is None), plus a read-only overview
+    table of every current row below it. Paired with `_select_row`.
+
+    `on_change(cfg)`, if given, runs after a successful Save/Delete --
+    e.g. states use it to prune cfg.dynamics of removed/renamed states.
+    `extra_values` are merged into the constructed dataclass alongside
+    the form's own fields -- e.g. measurement's `expression` field lives
+    OUTSIDE this form (see render_measurement) so it can get live
+    equation-syntax feedback per keystroke, which a field inside a form
+    can't (forms only report values on submit). `extra_keys_to_clear`
+    lets a caller ask for that kind of outside-form widget's session
+    state to be reset too, alongside this form's own fields, whenever a
+    Save/Delete resets the selector back to "+ Add new".
+
+    IMPORTANT: "Save" must be the FIRST st.form_submit_button rendered
+    below -- Streamlit's Enter-to-submit fires whichever submit button is
+    first in the form, regardless of which field has focus. Declaring
+    Delete first would make pressing Enter delete the row instead of
+    saving it -- exactly the kind of Enter-key surprise this whole
+    rewrite exists to get rid of."""
+    current = items[selected_idx] if selected_idx is not None else None
+
+    with st.form(key=f"{key_prefix}_form", clear_on_submit=True):
+        values = {}
+        for f in fields:
+            if current is not None:
+                default = getattr(current, f.attr)
+            else:
+                # required fields (currently just "name") have no
+                # dataclass default -- MISSING, not a usable value.
+                dc_default = spec_cls.__dataclass_fields__[f.attr].default
+                default = None if dc_default is MISSING else dc_default
+            widget_key = f"{key_prefix}_{selected_idx}_{f.attr}"
+            if f.kind == "text":
+                values[f.attr] = st.text_input(
+                    f.label, value=default or "", key=widget_key, help=f.help)
+            else:
+                values[f.attr] = st.number_input(
+                    f.label, value=default, min_value=f.min_value,
+                    key=widget_key, help=f.help)
+
+        save = st.form_submit_button("Save" if current is not None else "Add")
+        delete = st.form_submit_button("Delete") if current is not None else False
+
+    if save or delete:
+        if save:
+            name = values.get("name", "").strip()
+            if not name:
+                st.error("Please enter a name.")
+                return
+            values["name"] = name
+            new_item = spec_cls(**{**values, **(extra_values or {})})
+            if selected_idx is not None:
+                items[selected_idx] = new_item
+            else:
+                items.append(new_item)
+        else:
+            del items[selected_idx]
+        if on_change is not None:
+            on_change(cfg)
+        for k in (extra_keys_to_clear or []):
+            st.session_state.pop(k, None)
+        st.session_state.pop(f"{key_prefix}_select", None)
+        st.rerun()
+
+    if items:
+        st.dataframe(pd.DataFrame([asdict(i) for i in items]),
+                     use_container_width=True)
+    else:
+        st.caption("No rows yet.")
 
 
 # ----------------------------------------------------------------------
@@ -189,7 +289,7 @@ def render_start() -> None:
                 st.session_state.config = ModelConfig(name=name.strip())
                 st.session_state.validation_report = None
                 st.session_state.solver_report = None
-                _reset_editor_buffers()
+                _reset_row_editor_state()
                 _goto(0)
                 st.rerun()
 
@@ -206,7 +306,7 @@ def render_start() -> None:
                     st.session_state.config = load_model(sel)
                     st.session_state.validation_report = None
                     st.session_state.solver_report = None
-                    _reset_editor_buffers()
+                    _reset_row_editor_state()
                     _goto(0)
                     st.rerun()
                 except StorageError as e:
@@ -222,7 +322,7 @@ def render_start() -> None:
                 st.session_state.config = ModelConfig.from_dict(data)
                 st.session_state.validation_report = None
                 st.session_state.solver_report = None
-                _reset_editor_buffers()
+                _reset_row_editor_state()
                 _goto(0)
                 st.rerun()
             except json.JSONDecodeError as e:
@@ -247,7 +347,7 @@ def render_start() -> None:
                     st.session_state.config = load_model_from_path(path)
                     st.session_state.validation_report = None
                     st.session_state.solver_report = None
-                    _reset_editor_buffers()
+                    _reset_row_editor_state()
                     _goto(0)
                     st.rerun()
                 except StorageError as e:
@@ -276,94 +376,71 @@ def render_basics(cfg: ModelConfig) -> None:
 # Step 2: States
 # ----------------------------------------------------------------------
 
+_STATE_FIELDS = [
+    _Field("name", "Name", "text", help="e.g. x1 or demand"),
+    _Field("label", "Label (optional)", "text"),
+    _Field("initial_value", "Starting value", "float"),
+    _Field("min", "Minimum (optional)", "optional_float"),
+    _Field("max", "Maximum (optional)", "optional_float"),
+    _Field("process_noise", "Process noise scale", "float", min_value=0.0,
+           help="How much this quantity drifts randomly each step."),
+]
+
+
+def _prune_dynamics(cfg: ModelConfig) -> None:
+    valid_names = {s.name for s in cfg.states}
+    cfg.dynamics = {k: v for k, v in cfg.dynamics.items() if k in valid_names}
+
+
 def render_states(cfg: ModelConfig) -> None:
     st.header("2. States")
     st.write("How many quantities does your system keep track of over time?")
 
-    if "states_df" not in st.session_state:
-        st.session_state.states_df = pd.DataFrame({
-            "name": pd.Series([s.name for s in cfg.states], dtype="object"),
-            "label": pd.Series([s.label for s in cfg.states], dtype="object"),
-            "initial_value": pd.Series([s.initial_value for s in cfg.states], dtype="float64"),
-            "min": pd.Series([s.min for s in cfg.states], dtype="float64"),
-            "max": pd.Series([s.max for s in cfg.states], dtype="float64"),
-            "process_noise": pd.Series([s.process_noise for s in cfg.states], dtype="float64"),
-        })
-    edited = st.data_editor(
-        st.session_state.states_df, num_rows="dynamic", key="states_editor",
-        use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Name", help="e.g. x1 or demand"),
-            "label": st.column_config.TextColumn("Label (optional)"),
-            "initial_value": st.column_config.NumberColumn("Starting value"),
-            "min": st.column_config.NumberColumn("Minimum (optional)"),
-            "max": st.column_config.NumberColumn("Maximum (optional)"),
-            "process_noise": st.column_config.NumberColumn(
-                "Process noise scale", min_value=0.0,
-                help="How much this quantity drifts randomly each step."),
-        })
-    st.session_state.states_df = edited
-
-    new_states = []
-    for _, row in edited.iterrows():
-        name = _non_empty_str(row.get("name")).strip()
-        if not name:
-            continue
-        new_states.append(StateSpec(
-            name=name, label=_non_empty_str(row.get("label")),
-            initial_value=_nullable_float(row.get("initial_value")) or 0.0,
-            min=_nullable_float(row.get("min")),
-            max=_nullable_float(row.get("max")),
-            process_noise=_nullable_float(row.get("process_noise")) or 1.0))
-    cfg.states = new_states
-
-    valid_names = {s.name for s in cfg.states}
-    cfg.dynamics = {k: v for k, v in cfg.dynamics.items() if k in valid_names}
+    idx = _select_row(cfg.states, "states")
+    _row_form(cfg, cfg.states, StateSpec, _STATE_FIELDS, "states", idx,
+              on_change=_prune_dynamics)
 
 
 # ----------------------------------------------------------------------
 # Step 3: Actions
 # ----------------------------------------------------------------------
 
+_ACTION_FIELDS = [
+    _Field("name", "Name", "text", help="e.g. u1 or price"),
+    _Field("label", "Label (optional)", "text"),
+    _Field("min", "Minimum allowed value (required)", "float"),
+    _Field("max", "Maximum allowed value (required)", "float"),
+]
+
+
 def render_actions(cfg: ModelConfig) -> None:
     st.header("3. Actions")
     st.write("How many things can you choose or control at each step?")
 
-    if "actions_df" not in st.session_state:
-        st.session_state.actions_df = pd.DataFrame({
-            "name": pd.Series([a.name for a in cfg.actions], dtype="object"),
-            "label": pd.Series([a.label for a in cfg.actions], dtype="object"),
-            "min": pd.Series([a.min for a in cfg.actions], dtype="float64"),
-            "max": pd.Series([a.max for a in cfg.actions], dtype="float64"),
-        })
-    edited = st.data_editor(
-        st.session_state.actions_df, num_rows="dynamic", key="actions_editor",
-        use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Name", help="e.g. u1 or price"),
-            "label": st.column_config.TextColumn("Label (optional)"),
-            "min": st.column_config.NumberColumn("Minimum allowed value (required)"),
-            "max": st.column_config.NumberColumn("Maximum allowed value (required)"),
-        })
-    st.session_state.actions_df = edited
-
-    new_actions = []
-    for _, row in edited.iterrows():
-        name = _non_empty_str(row.get("name")).strip()
-        if not name:
-            continue
-        lo = _nullable_float(row.get("min"))
-        hi = _nullable_float(row.get("max"))
-        new_actions.append(ActionSpec(
-            name=name, label=_non_empty_str(row.get("label")),
-            min=lo if lo is not None else 0.0,
-            max=hi if hi is not None else 1.0))
-    cfg.actions = new_actions
+    idx = _select_row(cfg.actions, "actions")
+    _row_form(cfg, cfg.actions, ActionSpec, _ACTION_FIELDS, "actions", idx)
 
 
 # ----------------------------------------------------------------------
 # Step 4: Unknown parameters
 # ----------------------------------------------------------------------
+
+_PARAMETER_FIELDS = [
+    _Field("name", "Name", "text"),
+    _Field("label", "Label (optional)", "text"),
+    _Field("prior_guess", "Your best initial guess", "float"),
+    _Field("prior_variance", "How uncertain is that guess?", "float",
+           min_value=1e-9,
+           help="A larger number means you're less sure -- the "
+                "controller will explore more to pin this down."),
+    _Field("process_noise", "Drift/process noise scale", "float", min_value=0.0),
+    _Field("true_value", "True value (optional -- simulation/testing only)",
+           "optional_float",
+           help="Only fill this in if you're testing in simulation, "
+                "not on real data -- used to check whether the "
+                "controller learns correctly."),
+]
+
 
 def render_parameters(cfg: ModelConfig) -> None:
     st.header("4. Unknown parameters")
@@ -372,80 +449,27 @@ def render_parameters(cfg: ModelConfig) -> None:
         "know, but want the controller to learn from data as it runs? "
         "It's fine to have none.")
 
-    if "parameters_df" not in st.session_state:
-        st.session_state.parameters_df = pd.DataFrame({
-            "name": pd.Series([p.name for p in cfg.parameters], dtype="object"),
-            "label": pd.Series([p.label for p in cfg.parameters], dtype="object"),
-            "prior_guess": pd.Series([p.prior_guess for p in cfg.parameters], dtype="float64"),
-            "prior_variance": pd.Series([p.prior_variance for p in cfg.parameters], dtype="float64"),
-            "process_noise": pd.Series([p.process_noise for p in cfg.parameters], dtype="float64"),
-            "true_value": pd.Series([p.true_value for p in cfg.parameters], dtype="float64"),
-        })
-    edited = st.data_editor(
-        st.session_state.parameters_df, num_rows="dynamic", key="parameters_editor",
-        use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Name"),
-            "label": st.column_config.TextColumn("Label (optional)"),
-            "prior_guess": st.column_config.NumberColumn("Your best initial guess"),
-            "prior_variance": st.column_config.NumberColumn(
-                "How uncertain is that guess?", min_value=1e-9,
-                help="A larger number means you're less sure -- the "
-                     "controller will explore more to pin this down."),
-            "process_noise": st.column_config.NumberColumn(
-                "Drift/process noise scale", min_value=0.0),
-            "true_value": st.column_config.NumberColumn(
-                "True value (optional -- simulation/testing only)",
-                help="Only fill this in if you're testing in simulation, "
-                     "not on real data -- used to check whether the "
-                     "controller learns correctly."),
-        })
-    st.session_state.parameters_df = edited
-
-    new_params = []
-    for _, row in edited.iterrows():
-        name = _non_empty_str(row.get("name")).strip()
-        if not name:
-            continue
-        new_params.append(ParameterSpec(
-            name=name, label=_non_empty_str(row.get("label")),
-            prior_guess=_nullable_float(row.get("prior_guess")) or 0.0,
-            prior_variance=_nullable_float(row.get("prior_variance")) or 1.0,
-            process_noise=_nullable_float(row.get("process_noise")) or 0.05,
-            true_value=_nullable_float(row.get("true_value"))))
-    cfg.parameters = new_params
+    idx = _select_row(cfg.parameters, "parameters")
+    _row_form(cfg, cfg.parameters, ParameterSpec, _PARAMETER_FIELDS,
+              "parameters", idx)
 
 
 # ----------------------------------------------------------------------
 # Step 5: Constants
 # ----------------------------------------------------------------------
 
+_CONSTANT_FIELDS = [
+    _Field("name", "Name", "text"),
+    _Field("value", "Value", "float"),
+]
+
+
 def render_constants(cfg: ModelConfig) -> None:
     st.header("5. Constants")
     st.write("Any other fixed, known numbers your equations need?")
 
-    if "constants_df" not in st.session_state:
-        st.session_state.constants_df = pd.DataFrame({
-            "name": pd.Series([c.name for c in cfg.constants], dtype="object"),
-            "value": pd.Series([c.value for c in cfg.constants], dtype="float64"),
-        })
-    edited = st.data_editor(
-        st.session_state.constants_df, num_rows="dynamic", key="constants_editor",
-        use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Name"),
-            "value": st.column_config.NumberColumn("Value"),
-        })
-    st.session_state.constants_df = edited
-
-    new_constants = []
-    for _, row in edited.iterrows():
-        name = _non_empty_str(row.get("name")).strip()
-        if not name:
-            continue
-        new_constants.append(ConstantSpec(
-            name=name, value=_nullable_float(row.get("value")) or 0.0))
-    cfg.constants = new_constants
+    idx = _select_row(cfg.constants, "constants")
+    _row_form(cfg, cfg.constants, ConstantSpec, _CONSTANT_FIELDS, "constants", idx)
 
 
 # ----------------------------------------------------------------------
@@ -476,6 +500,12 @@ def render_dynamics(cfg: ModelConfig) -> None:
 # Step 7: Measurement
 # ----------------------------------------------------------------------
 
+_MEASUREMENT_FIELDS = [
+    _Field("name", "Output name", "text"),
+    _Field("noise_scale", "Measurement noise scale", "float", min_value=0.0),
+]
+
+
 def render_measurement(cfg: ModelConfig) -> None:
     st.header("7. Measurement")
     st.write("What can actually be observed/measured about your system?")
@@ -484,40 +514,21 @@ def render_measurement(cfg: ModelConfig) -> None:
         f"Known names: {', '.join(all_names) or '(none defined yet)'}. "
         f"Tip: to observe a state directly, just write its name.")
 
-    if "measurement_df" not in st.session_state:
-        st.session_state.measurement_df = pd.DataFrame({
-            "name": pd.Series([m.name for m in cfg.measurement], dtype="object"),
-            "expression": pd.Series([m.expression for m in cfg.measurement], dtype="object"),
-            "noise_scale": pd.Series([m.noise_scale for m in cfg.measurement], dtype="float64"),
-        })
-    edited = st.data_editor(
-        st.session_state.measurement_df, num_rows="dynamic", key="measurement_editor",
-        use_container_width=True,
-        column_config={
-            "name": st.column_config.TextColumn("Output name"),
-            "expression": st.column_config.TextColumn(
-                "Expression", help="e.g. a state name, to observe it directly"),
-            "noise_scale": st.column_config.NumberColumn(
-                "Measurement noise scale", min_value=0.0),
-        })
-    st.session_state.measurement_df = edited
+    # `expression` lives OUTSIDE the row-editor form (unlike name/noise_scale
+    # below) specifically so it can get live equation-syntax feedback as you
+    # type -- st.form only reports its contents on submit, so a field inside
+    # one can't have per-keystroke feedback the way Dynamics/Cost do.
+    idx = _select_row(cfg.measurement, "measurement")
+    current = cfg.measurement[idx] if idx is not None else None
+    expr_key = f"measurement_{idx}_expression"
+    expression = st.text_input(
+        "Expression", value=current.expression if current else "",
+        key=expr_key, help="e.g. a state name, to observe it directly")
+    _show_equation_feedback(expression, all_names)
 
-    new_measurement = []
-    for _, row in edited.iterrows():
-        name = _non_empty_str(row.get("name")).strip()
-        if not name:
-            continue
-        expr = _non_empty_str(row.get("expression"))
-        new_measurement.append(MeasurementSpec(
-            name=name, expression=expr,
-            noise_scale=_nullable_float(row.get("noise_scale")) or 1.0))
-    cfg.measurement = new_measurement
-
-    for m in cfg.measurement:
-        if m.expression.strip():
-            ok, msg = check_equation_live(m.expression, all_names)
-            if not ok:
-                st.error(f"'{m.name}': {msg}", icon="⚠️")
+    _row_form(cfg, cfg.measurement, MeasurementSpec, _MEASUREMENT_FIELDS,
+              "measurement", idx, extra_values={"expression": expression},
+              extra_keys_to_clear=[expr_key])
 
 
 # ----------------------------------------------------------------------
@@ -748,6 +759,15 @@ def main() -> None:
     st.set_page_config(page_title="Model Wizard", layout="wide")
     _init_state()
 
+    # "Start over" (below) can't call _goto(0) directly: by the time its
+    # button is clicked, the sidebar's step_idx radio has ALREADY been
+    # instantiated earlier in this same script run (see _goto's own
+    # docstring), and Streamlit refuses to overwrite a widget's
+    # session_state value after that widget has rendered this run. Defer
+    # the actual reset to the TOP of the next run, before the radio exists.
+    if st.session_state.pop("_pending_step_reset", False):
+        _goto(0)
+
     cfg = st.session_state.config
 
     with st.sidebar:
@@ -772,8 +792,8 @@ def main() -> None:
                 st.session_state.config = None
                 st.session_state.validation_report = None
                 st.session_state.solver_report = None
-                _reset_editor_buffers()
-                _goto(0)
+                _reset_row_editor_state()
+                st.session_state["_pending_step_reset"] = True
                 st.rerun()
 
     if cfg is None:
