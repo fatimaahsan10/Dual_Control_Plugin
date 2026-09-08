@@ -132,6 +132,25 @@ def _show_equation_feedback(text: str, all_names: list[str]) -> None:
         st.error(msg, icon="⚠️")
 
 
+def _equation_syntax_caption(all_names: list[str]) -> None:
+    """Shared "how do I write an equation here" help, shown above every
+    equation-entry field (Dynamics/Measurement/Cost). Previously only
+    Dynamics explained the syntax at all, and none of the three steps
+    showed a worked example -- a real source of confusion reported by a
+    user (equations look like a single free-text box with no visible
+    hint of what's actually accepted)."""
+    example = f"0.5*{all_names[0]} - sin({all_names[1]})" if len(all_names) >= 2 \
+        else "0.5*x1 - sin(u1)" if not all_names \
+        else f"0.5*{all_names[0]}^2"
+    st.caption(
+        f"Known names: {', '.join(all_names) or '(none defined yet)'}. "
+        f"Write ordinary math: `+ - * / ^` (`^` is power) and parentheses, "
+        f"decimal numbers like `3.14`, and these functions: "
+        f"{', '.join(sorted(ALLOWED_FUNCTIONS))} (plus the constants `pi`, "
+        f"`e`). **Multiplication must be written out** -- `2*x1`, never "
+        f"`2x1`. Example: `{example}`")
+
+
 # ----------------------------------------------------------------------
 # Shared row-list editor for steps 2-5 and 7 (states/actions/parameters/
 # constants/measurement) -- add/edit/delete ONE row at a time via plain
@@ -479,10 +498,7 @@ def render_constants(cfg: ModelConfig) -> None:
 def render_dynamics(cfg: ModelConfig) -> None:
     st.header("6. Dynamics")
     all_names = cfg.all_defined_names()
-    st.caption(
-        f"Known names: {', '.join(all_names) or '(none defined yet)'}. "
-        f"Allowed functions: {', '.join(sorted(ALLOWED_FUNCTIONS))}. "
-        f"Write multiplication explicitly (2*x1, not 2x1).")
+    _equation_syntax_caption(all_names)
 
     if not cfg.states:
         st.warning("Define at least one state first (step 2).")
@@ -510,9 +526,8 @@ def render_measurement(cfg: ModelConfig) -> None:
     st.header("7. Measurement")
     st.write("What can actually be observed/measured about your system?")
     all_names = cfg.all_defined_names()
-    st.caption(
-        f"Known names: {', '.join(all_names) or '(none defined yet)'}. "
-        f"Tip: to observe a state directly, just write its name.")
+    _equation_syntax_caption(all_names)
+    st.caption("Tip: to observe a state directly, just write its name.")
 
     # `expression` lives OUTSIDE the row-editor form (unlike name/noise_scale
     # below) specifically so it can get live equation-syntax feedback as you
@@ -542,7 +557,7 @@ def render_cost(cfg: ModelConfig) -> None:
         "well and LARGE when they're going badly -- this is what the "
         "controller tries to minimize each step.")
     all_names = cfg.all_defined_names()
-    st.caption(f"Known names: {', '.join(all_names) or '(none defined yet)'}.")
+    _equation_syntax_caption(all_names)
 
     cfg.cost.running = st.text_area(
         "Running cost (evaluated every step)", value=cfg.cost.running,
