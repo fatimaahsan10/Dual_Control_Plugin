@@ -130,6 +130,60 @@ def test_inf_result_is_caught_and_reported(monkeypatch):
     assert any("invalid numbers" in m for m in report.messages)
 
 
+# ----------------------------------------------------------------------
+# control_method == "ilqg" + constraints (the extension this test file's
+# neighboring "ilqr" section already covers for the other control method
+# -- see extensions/dual_control/main_outer_control_loop.py's/
+# ilqg_function.py's own constraint_fn docstrings for what changed).
+# ----------------------------------------------------------------------
+
+def test_ilqg_with_constraint_runs_end_to_end_and_actually_binds():
+    """Same _small_config() plant proven above, plus one state_action
+    constraint (u1 <= 30) tighter than the plain action bound (u1 in
+    [10,45]). Checks the run completes AND that the constraint visibly
+    changes the outcome relative to the unconstrained run -- not just
+    that the code path doesn't crash."""
+    unconstrained = _small_config()
+    report_wide = run_solver(unconstrained)
+    assert report_wide.ok, report_wide.messages
+
+    config = _small_config()
+    config.constraints = [ConstraintSpec(
+        name="u1_cap", kind="state_action", expression="30 - u1", enabled=True)]
+    report = run_solver(config)
+    assert report.ok, report.messages
+    assert report.result is not None
+
+    u = report.result["u"]
+    assert np.all(np.isfinite(u))
+    assert np.all(u <= 30.0 + 1e-6)
+
+    # the unconstrained run should push u1 noticeably above 30 somewhere
+    # in the horizon -- otherwise this constraint would be vacuous and
+    # the test wouldn't actually be checking anything.
+    assert np.max(report_wide.result["u"]) > 30.0 + 1e-3
+
+
+def test_ilqg_bad_constraint_expression_never_reaches_the_solver():
+    config = _small_config()
+    config.constraints = [ConstraintSpec(
+        name="bad", kind="state_action", expression="1 - nonsense_name",
+        enabled=True)]
+    report = run_solver(config)
+    assert not report.ok
+    assert any("nonsense_name" in m for m in report.messages)
+
+
+def test_ilqg_constraint_with_tanh_squash_is_rejected_before_solving():
+    config = _small_config()
+    config.solver.u_lim_method = 2  # tanh-squash
+    config.constraints = [ConstraintSpec(
+        name="u1_cap", kind="state_action", expression="30 - u1", enabled=True)]
+    report = run_solver(config)
+    assert not report.ok
+    assert any("Box-QP" in m for m in report.messages)
+
+
 def test_run_solver_never_raises_on_garbage_config():
     config = ModelConfig(name="")
     report = run_solver(config)

@@ -7,7 +7,13 @@ and UNMODIFIED:
       extensions/dual_control/main_outer_control_loop() -- exactly what
       applications/dynamic_pricing/run_pricing_demo.py and
       applications/duopoly_pricing/run_duopoly_demo.py already do by
-      hand. Unchanged from before this dispatch existed.
+      hand, PLUS (if the config has any enabled constraints) the same
+      wizard/core_ilqr_adapter.py::build_constraint_fn() the "ilqr" path
+      already uses, now also fed into main_outer_control_loop()'s own
+      constraint_fn parameter -- see core_ilqr_adapter.build_constraint_fn's
+      docstring for the one documented caveat this reuse carries
+      ("state_only" constraints on a model with unknown parameters use
+      their fixed prior, not the online estimate).
 
   "ilqr" -- compile the config via wizard/core_ilqr_adapter.py (which
       itself reuses generic_plant.py's compile_plant(), plus, if the
@@ -45,7 +51,9 @@ import numpy as np
 
 from extensions.dual_control.main_outer_control_loop import main_outer_control_loop
 
-from wizard.core_ilqr_adapter import ConstraintCompilationError, compile_ilqr, solve_ilqr
+from wizard.core_ilqr_adapter import (
+    build_constraint_fn, ConstraintCompilationError, compile_ilqr, solve_ilqr,
+)
 from wizard.generic_plant import compile_plant, PlantCompilationError
 from wizard.schema import ModelConfig
 
@@ -146,7 +154,8 @@ def _run_ilqg(config: ModelConfig,
                timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> SolverReport:
     try:
         plant = compile_plant(config)
-    except PlantCompilationError as e:
+        constraint_fn = build_constraint_fn(plant, config)
+    except (PlantCompilationError, ConstraintCompilationError) as e:
         return SolverReport(ok=False, messages=list(e.errors))
     except Exception as e:  # noqa: BLE001
         return SolverReport(
@@ -191,7 +200,7 @@ def _run_ilqg(config: ModelConfig,
             max_du_iterations=s.max_du_iterations,
             first_run_max_du_iterations=s.first_run_max_du_iterations,
             augment_states_in_ilqg=augment, augment_states_in_filter=augment,
-            verbose=False)
+            verbose=False, constraint_fn=constraint_fn)
 
     start = time.monotonic()
     executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)

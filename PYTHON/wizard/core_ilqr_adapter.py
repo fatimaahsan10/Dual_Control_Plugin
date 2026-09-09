@@ -2,6 +2,13 @@
 Adapter from the wizard's generic model config to core/ddp_solver/ilqg.py's
 calling convention -- the "iLQR" control method (see schema.CONTROL_METHODS).
 
+NOTE: build_constraint_fn() below (and everything it depends on) is used
+by BOTH control methods, not just "ilqr" -- see its own docstring's
+"REUSED BY BOTH CONTROL METHODS" section. step_fn/derivs_fn/compile_ilqr/
+solve_ilqr remain "ilqr"-only, since the "ilqg" path has its own separate
+solver entry point (extensions/dual_control/main_outer_control_loop()),
+called directly by wizard/solver_runner.py, not through this module.
+
 This is the counterpart, for the iLQR path, to generic_plant.py+
 main_outer_control_loop() for the iLQG path: it is pure GLUE CODE, built
 once, generically, from whatever states/actions/constants/dynamics/cost a
@@ -317,6 +324,29 @@ def build_constraint_fn(plant: CompiledPlant, config: ModelConfig) -> Optional[C
     magnitude residual gap, not a bug (see wizard/
     test_robot_arm_example.py::test_torque_derating_constraint_actually_
     binds_early's tolerance and comment).
+
+    REUSED BY BOTH CONTROL METHODS: this function is control-method-
+    agnostic (its output is just callable(x_traj, u_traj) -> (N,m,2)),
+    so wizard/solver_runner.py's "ilqg" branch calls it too, feeding the
+    result into extensions/dual_control/main_outer_control_loop()'s own
+    (now equally optional) constraint_fn parameter -- see that module's
+    and ilqg_function.py's docstrings. ONE real difference between the
+    two paths for a "state_only" row: `dyn_fn` above (the continuous
+    dynamics used for that row's Lie-derivative reduction) is built via
+    `_build_plain_continuous_dynamics`, which always evaluates
+    plant.continuous_dynamics with augment_states=False, i.e. at each
+    unknown parameter's FIXED prior_guess/true_value (whichever
+    compile_plant() put in plant.constants.prior) -- never at the "ilqg"
+    path's evolving online parameter ESTIMATE. A "state_only" constraint
+    on a model with n_p > 0 is therefore reduced using a slightly-wrong
+    (prior, not current-estimate) dynamics model throughout the whole
+    dual-control run; a "state_action" constraint is entirely unaffected
+    (no dynamics/Lie-derivative involved at all). Not fixed here --
+    correctly re-building the reduction from the current p_hat every
+    session would require passing p_hat into build_constraint_fn() from
+    inside the outer loop itself, a bigger change than this hook's scope;
+    flagged rather than silently accepted, same convention as every
+    other documented limitation in this file.
     """
     enabled = [c for c in config.constraints if c.enabled]
     if not enabled:

@@ -522,20 +522,21 @@ def render_constraints(cfg: ModelConfig) -> None:
         "constraint math, just a generic way to describe one. It's fine "
         "to have none. Action bounds (step 3) always apply regardless.")
     st.caption(
-        "**Only enforced in iLQR control method** (Advanced settings, "
-        "step 10) -- iLQG / Dual Control has no hook for this. A "
+        "**Works with either Control method** (Advanced settings, "
+        "step 10) -- iLQR re-solves the constraint's box bound once per "
+        "solver iteration; iLQG / Dual Control re-solves it once per "
+        "session, on top of its usual re-planning and estimation. A "
         "constraint only actually restricts anything if it (or, for an "
         "h(x) constraint, its Lie derivative) depends on exactly one "
         "action -- Test This Model will warn you if a constraint you "
         "wrote turns out not to.")
-
-    if (cfg.control_method != "ilqr" and cfg.constraints
-            and any(c.enabled for c in cfg.constraints)):
-        st.warning(
-            "Control method is currently iLQG / Dual Control -- these "
-            "constraint(s) will be rejected at Validate time until you "
-            "either switch Control method to iLQR (Advanced settings) or "
-            "disable/remove them.", icon="⚠️")
+    if cfg.parameters and any(c.kind == "state_only" and c.enabled
+                                for c in cfg.constraints):
+        st.caption(
+            "Note: an h(x) constraint's Lie-derivative reduction uses "
+            "this model's known/prior parameter values throughout the "
+            "run, never the online parameter estimate -- see "
+            "wizard/core_ilqr_adapter.py's build_constraint_fn docstring.")
 
     idx = _select_row(cfg.constraints, "constraints")
     current = cfg.constraints[idx] if idx is not None else None
@@ -680,8 +681,7 @@ def render_cost(cfg: ModelConfig) -> None:
 _CONTROL_METHOD_LABELS = {
     "ilqg": "iLQG / Dual Control -- estimates unknown parameters online "
              "while controlling (MPC replanning every step)",
-    "ilqr": "iLQR -- one deterministic full-horizon solve, no estimation "
-             "(required for step 5's constraints)",
+    "ilqr": "iLQR -- one deterministic full-horizon solve, no estimation",
 }
 
 

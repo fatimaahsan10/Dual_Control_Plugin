@@ -123,8 +123,70 @@ def test_outer_loop_runs_and_adapts_parameter_estimate():
     )
 
 
+def test_constraint_fn_threads_through_to_every_session():
+    """Dastan & Sensinger (2024) extension: an optional constraint_fn is
+    forwarded unchanged to every session's ilqg_function() call (verified
+    directly at that layer in test_ilqg_function.py) -- this test checks
+    the WIRING at the outer-loop level: does supplying one actually
+    change the applied control `u` across a real multi-session MPC run,
+    and does it do so on every session, not just the first."""
+    rng = np.random.default_rng(0)
+    nx, nu, n_p, ny, nv = 2, 1, 1, 2, 2
+
+    A, B0, dynamics, measurement, cost, continuous_dynamics = make_system(
+        rng, nx, nu, n_p, ny)
+
+    x_hat_0 = np.array([1.0, -0.5])
+    x_true_0 = x_hat_0.copy()
+    p_true = np.array([1.0])
+    p_hat_0 = np.array([0.4])
+    cov_X = 0.1
+    cov_P = 0.2 * np.eye(n_p)
+    constants = np.zeros(0)
+    u_lims = np.array([[-2.0, 2.0]])
+    tight_lims = np.array([[-0.05, 0.05]])
+    N_sessions = 5
+    calls = []
+
+    def constraint_fn(x_traj, u_traj):
+        calls.append(x_traj.shape[1])
+        return np.tile(tight_lims, (x_traj.shape[1], 1, 1))
+
+    result = main_outer_control_loop(
+        T=N_sessions, dt=1, x_hat_0=x_hat_0, x_true_0=x_true_0,
+        p_hat_0=p_hat_0, p_true=p_true, cov_X=cov_X, cov_P=cov_P,
+        constants=constants, u_lims=u_lims, u_lim_method=1,
+        dynamics=dynamics, measurement=measurement, cost=cost,
+        continuous_dynamics=continuous_dynamics, ny=ny, nv=nv,
+        max_du_iterations=30, first_run_max_du_iterations=50,
+        verbose=False, constraint_fn=constraint_fn)
+
+    # called at least once per outer session (N_sessions - 1 applied
+    # controls), possibly more (re-differentiation can happen more than
+    # once per session as the inner iLQG loop iterates)
+    assert len(calls) >= N_sessions - 1
+
+    assert np.all(np.isfinite(result["u"]))
+    assert np.all(result["u"] >= tight_lims[0, 0] - 1e-6)
+    assert np.all(result["u"] <= tight_lims[0, 1] + 1e-6)
+
+    # confirm the tight box is actually binding across the run, not
+    # vacuously satisfied: the SAME setup without constraint_fn (plain
+    # wide u_lims) should use a visibly larger control somewhere.
+    result_wide = main_outer_control_loop(
+        T=N_sessions, dt=1, x_hat_0=x_hat_0, x_true_0=x_true_0,
+        p_hat_0=p_hat_0, p_true=p_true, cov_X=cov_X, cov_P=cov_P,
+        constants=constants, u_lims=u_lims, u_lim_method=1,
+        dynamics=dynamics, measurement=measurement, cost=cost,
+        continuous_dynamics=continuous_dynamics, ny=ny, nv=nv,
+        max_du_iterations=30, first_run_max_du_iterations=50,
+        verbose=False)
+    assert np.max(np.abs(result_wide["u"])) > np.max(np.abs(result["u"])) + 1e-3
+
+
 if __name__ == "__main__":
-    tests = [test_outer_loop_runs_and_adapts_parameter_estimate]
+    tests = [test_outer_loop_runs_and_adapts_parameter_estimate,
+              test_constraint_fn_threads_through_to_every_session]
     for t in tests:
         t()
         print(f"PASS: {t.__name__}")

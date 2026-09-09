@@ -287,30 +287,38 @@ def test_state_action_constraint_alpha_not_checked():
     assert not any("alpha" in e for e in errors)
 
 
-def test_enabled_constraint_requires_ilqr_control_method():
+def test_enabled_constraint_allowed_under_ilqg_control_method():
+    """extensions/dual_control/main_outer_control_loop()/ilqg_function()
+    now accept the same optional constraint_fn hook core/ddp_solver/
+    ilqg.py already had (see those modules' docstrings) -- an enabled
+    constraint is no longer restricted to control_method=="ilqr"."""
     cfg = _minimal_valid_config()
-    cfg.control_method = "ilqg"  # default -- no constraint_fn hook there
+    cfg.control_method = "ilqg"  # default -- u_lim_method defaults to 1
     cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
                                         expression="1 - u1", enabled=True)]
     errors = cfg.validate()
-    assert any("only enforced in iLQR" in e for e in errors)
-
-
-def test_disabled_constraint_does_not_require_ilqr():
-    cfg = _minimal_valid_config()
-    cfg.control_method = "ilqg"
-    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
-                                        expression="1 - u1", enabled=False)]
-    errors = cfg.validate()
-    assert not any("only enforced in iLQR" in e for e in errors)
+    assert not any("constraint" in e.lower() for e in errors)
 
 
 def test_enabled_constraint_requires_box_qp_bound_method():
+    for control_method in ("ilqg", "ilqr"):
+        cfg = _minimal_valid_config()
+        cfg.control_method = control_method
+        cfg.n_sessions = 5
+        cfg.solver.u_lim_method = 2  # tanh-squash
+        cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                            expression="1 - u1", enabled=True)]
+        errors = cfg.validate()
+        assert any("Box-QP" in e for e in errors), (
+            f"control_method={control_method!r} did not flag the "
+            f"tanh-squash/constraint combination")
+
+
+def test_disabled_constraint_does_not_require_box_qp():
     cfg = _minimal_valid_config()
-    cfg.control_method = "ilqr"
-    cfg.n_sessions = 5
-    cfg.solver.u_lim_method = 2  # tanh-squash
+    cfg.control_method = "ilqg"
+    cfg.solver.u_lim_method = 2
     cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
-                                        expression="1 - u1", enabled=True)]
+                                        expression="1 - u1", enabled=False)]
     errors = cfg.validate()
-    assert any("Box-QP" in e for e in errors)
+    assert not any("Box-QP" in e for e in errors)

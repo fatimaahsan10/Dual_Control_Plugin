@@ -186,11 +186,88 @@ def test_two_channel_constraint_reported_as_plugin_contract_issue():
 
 def test_disabled_constraint_in_ilqg_mode_does_not_block_validation():
     """A DISABLED constraint left over from switching control_method back
-    to iLQG must not block validation -- only an ENABLED constraint in
-    non-"ilqr" mode is a structural error (schema.py's own rule)."""
+    to iLQG must not block validation -- a disabled constraint is never
+    compiled/checked regardless of control_method (schema.py's own rule)."""
     config = _valid_ilqr_config(constraints=[
         ConstraintSpec(name="c", kind="state_action", expression="5 - u1", enabled=False)])
     config.control_method = "ilqg"
     config.parameters = []
     report = run_validation(config)
     assert report.ok
+
+
+# ----------------------------------------------------------------------
+# control_method == "ilqg" + constraints (extensions/dual_control/
+# main_outer_control_loop.py's/ilqg_function.py's constraint_fn hook --
+# see those modules' docstrings. _validate_ilqg() now runs the SAME
+# build_constraint_fn()/validate_constraint_fn() checks the "ilqr"
+# section above already exercises.)
+# ----------------------------------------------------------------------
+
+def _valid_ilqg_constrained_config(constraints=None) -> ModelConfig:
+    return ModelConfig(
+        name="valid_ilqg_constrained", dt=0.1, n_sessions=6,
+        control_method="ilqg",
+        states=[StateSpec(name="x1", initial_value=-2.0)],
+        actions=[ActionSpec(name="u1", min=-10.0, max=10.0)],
+        dynamics={"x1": "u1"},
+        measurement=[MeasurementSpec(name="y1", expression="x1")],
+        cost=CostSpec(running="x1**2 + 0.001*u1**2", terminal="5*x1**2"),
+        constraints=constraints or [],
+    )
+
+
+def test_valid_ilqg_state_action_constraint_passes_with_no_warnings():
+    config = _valid_ilqg_constrained_config(constraints=[
+        ConstraintSpec(name="cap", kind="state_action", expression="5 - u1", enabled=True)])
+    report = run_validation(config)
+    assert report.ok, report.messages
+    assert report.warnings == []
+
+
+def test_ilqg_bad_constraint_expression_reports_plain_message():
+    config = _valid_ilqg_constrained_config(constraints=[
+        ConstraintSpec(name="bad", kind="state_action",
+                        expression="1 - totally_unknown_name", enabled=True)])
+    report = run_validation(config)
+    assert not report.ok
+    assert any("totally_unknown_name" in m for m in report.messages)
+
+
+def test_ilqg_relative_degree_zero_constraint_surfaces_as_advisory_warning():
+    """Same scenario as test_relative_degree_zero_constraint_surfaces_as_
+    advisory_warning above (a constraint whose Lie derivative never
+    touches the only action), but through the "ilqg" dispatch branch --
+    confirms _validate_ilqg's own warnings.catch_warnings capture works,
+    not just _validate_ilqr's."""
+    config = ModelConfig(
+        name="rd_zero_ilqg", dt=0.1, n_sessions=6, control_method="ilqg",
+        states=[StateSpec(name="x1", initial_value=0.0), StateSpec(name="x2", initial_value=0.0)],
+        actions=[ActionSpec(name="u1", min=-10.0, max=10.0)],
+        dynamics={"x1": "x2", "x2": "u1"},
+        measurement=[MeasurementSpec(name="y1", expression="x1")],
+        cost=CostSpec(running="x1**2 + u1**2", terminal="0"),
+        constraints=[ConstraintSpec(name="pos_cap", kind="state_only",
+                                      expression="100 - x1", alpha=0.5, enabled=True)],
+    )
+    report = run_validation(config)
+    assert report.ok
+    assert len(report.warnings) == 1
+    assert "relative degree" in report.warnings[0]
+
+
+def test_ilqg_two_channel_constraint_reported_as_plugin_contract_issue():
+    config = ModelConfig(
+        name="two_action_ilqg", dt=0.1, n_sessions=5, control_method="ilqg",
+        states=[StateSpec(name="x1", initial_value=0.0)],
+        actions=[ActionSpec(name="u1", min=-10.0, max=10.0),
+                 ActionSpec(name="u2", min=-10.0, max=10.0)],
+        dynamics={"x1": "u1 + u2"},
+        measurement=[MeasurementSpec(name="y1", expression="x1")],
+        cost=CostSpec(running="x1**2 + u1**2 + u2**2", terminal="0"),
+        constraints=[ConstraintSpec(name="both", kind="state_action",
+                                      expression="1 - u1 - u2", enabled=True)],
+    )
+    report = run_validation(config)
+    assert not report.ok
+    assert any("constraint" in m.lower() for m in report.messages)

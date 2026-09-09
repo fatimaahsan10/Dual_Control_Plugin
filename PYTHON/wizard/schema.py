@@ -45,10 +45,15 @@ SCHEMA_VERSION = 1
 # MPC replanning + SPKF state/parameter estimation every step. "ilqr"
 # routes through core/ddp_solver/ilqg.py instead: one deterministic
 # full-horizon solve, no estimation, no replanning -- see
-# wizard/core_ilqr_adapter.py. Only "ilqr" models can attach constraints
-# (see ConstraintSpec below) -- main_outer_control_loop() has no
-# constraint_fn hook and this project does not modify that shared solver
-# to add one.
+# wizard/core_ilqr_adapter.py. BOTH control methods can attach constraints
+# (see ConstraintSpec below): main_outer_control_loop()/ilqg_function() now
+# accept the same optional constraint_fn hook core/ddp_solver/ilqg.py
+# already had -- see extensions/dual_control/ilqg_function.py's own
+# docstring for the one real difference between the two paths (a
+# "state_only" constraint's Lie-derivative reduction uses this model's
+# fixed/prior parameter values even under "ilqg", never the online
+# parameter ESTIMATE, since the reduction is built once from compile_plant()
+# rather than re-built every session).
 CONTROL_METHODS = ("ilqg", "ilqr")
 
 # ConstraintSpec.kind values -- see ConstraintSpec's own docstring.
@@ -126,13 +131,17 @@ class CostSpec:
 
 @dataclass
 class ConstraintSpec:
-    """One inequality constraint h(...) >= 0, enforced only in "ilqr"
-    control-method models (see CONTROL_METHODS above) via
-    wizard/core_ilqr_adapter.py composing the EXISTING, UNMODIFIED
-    extensions/constraints/ (Dastan & Sensinger 2024) machinery -- this
-    schema field does not introduce any new constraint math of its own,
-    only a generic way to describe which of that machinery's two variants
-    a given expression should go through.
+    """One inequality constraint h(...) >= 0, enforced in EITHER
+    control-method model (see CONTROL_METHODS above) via
+    wizard/core_ilqr_adapter.py's build_constraint_fn() composing the
+    EXISTING, UNMODIFIED extensions/constraints/ (Dastan & Sensinger 2024)
+    machinery -- this schema field does not introduce any new constraint
+    math of its own, only a generic way to describe which of that
+    machinery's two variants a given expression should go through.
+    build_constraint_fn()'s own output is control-method-agnostic (a plain
+    callable(x_traj, u_traj) -> (N,m,2) array); wizard/solver_runner.py
+    passes the SAME compiled constraint_fn to whichever solver
+    config.control_method selects.
 
     kind == "state_action": `expression` is h(x, u) -- may reference
         states, actions, and constants. Passed directly to
@@ -433,18 +442,13 @@ class ModelConfig:
                         f"how quickly the constraint's own reduction term "
                         f"decays -- see extensions/constraints/"
                         f"relative_degree_reduction.py).")
-        if self.constraints and any(c.enabled for c in self.constraints):
-            if self.control_method != "ilqr":
-                errors.append(
-                    "Constraints are only enforced in iLQR control method -- "
-                    "switch Control method to iLQR, or disable/remove the "
-                    "constraint(s), to proceed.")
-            elif self.solver.u_lim_method != 1:
-                errors.append(
-                    "Constraints require the 'Box-QP' bound enforcement "
-                    "method (Advanced settings) -- the tanh-squash method "
-                    "doesn't compose sensibly with state-dependent control "
-                    "bounds.")
+        if (self.constraints and any(c.enabled for c in self.constraints)
+                and self.solver.u_lim_method != 1):
+            errors.append(
+                "Constraints require the 'Box-QP' bound enforcement "
+                "method (Advanced settings) -- the tanh-squash method "
+                "doesn't compose sensibly with state-dependent control "
+                "bounds.")
 
         s = self.solver
         if s.u_lim_method not in (1, 2):

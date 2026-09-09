@@ -36,6 +36,14 @@ DEVIATION FROM THE LITERAL MATLAB SOURCE: dynamics/measurement/cost/
 continuous_dynamics are explicit callables, matching every other module
 in this port, rather than hardcoded calls to the SIDARTHE-specific
 functions.
+
+Optional `constraint_fn` param (Dastan & Sensinger 2024 extension): passed
+straight through, unchanged per outer MPC step, to each session's
+ilqg_function() call -- see that module's own docstring for what it does
+and its restriction to u_lim_method == 1. This function itself does not
+call constraint_fn directly; it is purely a pass-through, so a caller who
+never supplies one (every existing caller of this function, at the time
+this was added) is completely unaffected.
 """
 
 import numpy as np
@@ -55,7 +63,7 @@ def main_outer_control_loop(
         keep_dyn_noise=False, keep_meas_noise=False,
         keep_dyn_noise_filter=True, keep_meas_noise_filter=True,
         horizon_mode=2, h=np.sqrt(3), additive_noise=False,
-        first_run_seeds=1, u_bar_0=None, verbose=False):
+        first_run_seeds=1, u_bar_0=None, verbose=False, constraint_fn=None):
     """
     Returns a dict: x_hat, p_hat, x_true, xa_true, u, y_true, cost_true,
     cost_est (all (dim, N) or (N,) shaped -- see body), total_true_cost.
@@ -67,6 +75,11 @@ def main_outer_control_loop(
         non-convex cost landscape's first solve away from the all-zero
         local optimum that a bilinear (cross-therapy) cost surface can
         otherwise settle into; not in the original MATLAB source.
+
+    constraint_fn : optional callable, forwarded unchanged to every
+        session's ilqg_function() call -- see ilqg_function's own
+        docstring. Not in the original MATLAB source; defaults to None
+        (identical to every call site predating this parameter).
     """
     if first_run_seeds > 1:
         raise NotImplementedError(
@@ -138,7 +151,7 @@ def main_outer_control_loop(
             dlambda, constants, p_hat[:, iter_outer], cov_xa_hat_ilqg,
             augment_states_in_ilqg, reg_type, u_lims, ny, nv, nw, max_iters,
             dyn_noise_reg, None, u_lim_method, dynamics, measurement, cost,
-            simulate_system, verbose=False)
+            simulate_system, verbose=False, constraint_fn=constraint_fn)
         u[:, iter_outer] = unew[:, 0]
 
         if reset_lambda:

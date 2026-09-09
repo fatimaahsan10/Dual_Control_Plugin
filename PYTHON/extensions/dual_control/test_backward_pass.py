@@ -140,10 +140,65 @@ def test_respects_control_limits():
     assert np.all(l >= lims[:, 0:1] - 1e-8) and np.all(l <= lims[:, 1:2] + 1e-8)
 
 
+def test_respects_per_timestep_control_limits():
+    """Dastan & Sensinger (2024) extension: `lims` may also be a (N-1,m,2)
+    per-timestep array (mirroring core/ddp_solver/back_pass.py's own
+    ndim==3 branch), each row applying only at its own control step. Two
+    DIFFERENT boxes, one per timestep, each hand-picked tight enough that
+    the unconstrained optimum (checked to lie outside both, via the
+    unconstrained sibling test's stationarity condition) must be clipped
+    -- and clipped to the box that actually applies at that k, not the
+    other one."""
+    rng = np.random.default_rng(3)
+    n, m, N, ny, nw, nv = 3, 2, 6, 2, 2, 2
+
+    (A, B, c, Cx, Cu, d, Dx, Du, E, F, K,
+     q0, q, Q, r, R, P) = make_random_dual_system(rng, n, m, N, ny, nw, nv)
+    u = np.zeros((m, N - 1))
+
+    # box_A applies at even k, box_B at odd k -- deliberately disjoint
+    # ranges so a bug that used the same box everywhere (or shifted by
+    # one index) would show up as an out-of-range violation.
+    box_A = np.array([[-0.05, 0.05], [-0.05, 0.05]])
+    box_B = np.array([[0.2, 0.4], [-0.4, -0.2]])
+    lims_per_step = np.stack(
+        [box_A if k % 2 == 0 else box_B for k in range(N - 1)], axis=0)
+    assert lims_per_step.shape == (N - 1, m, 2)
+
+    diverge, l, L, s0_alpha = backward_pass(
+        A, B, c, Cx, Cu, d, Dx, Du, E, F, K, None, None, None,
+        q0, q, Q, r, R, P, lam=1.0, reg_type=1, lims=lims_per_step, u=u, nv=nv)
+
+    assert diverge == 0
+    for k in range(N - 1):
+        box_k = box_A if k % 2 == 0 else box_B
+        assert np.all(l[:, k] >= box_k[:, 0] - 1e-8)
+        assert np.all(l[:, k] <= box_k[:, 1] + 1e-8)
+
+    # The backward recursion propagates Sx/sx from k+1 into step k, so a
+    # box choice at one k generally changes the control law at every
+    # EARLIER k too -- except the very LAST controlled step (k = N-2),
+    # which only ever sees the fixed terminal boundary values (Sx[N-1]
+    # etc.), never anything influenced by another step's box. That one
+    # step's result must therefore match a run using box_A everywhere
+    # EXACTLY (same box, same boundary data) -- catches a bug that
+    # silently ignored lims.ndim and always read lims[0,0]/lims[0,1] as a
+    # scalar pair regardless of shape.
+    last_k = N - 2
+    assert last_k % 2 == 0  # sanity: this test's box_A applies there
+    diverge_a, l_a, L_a, _ = backward_pass(
+        A, B, c, Cx, Cu, d, Dx, Du, E, F, K, None, None, None,
+        q0, q, Q, r, R, P, lam=1.0, reg_type=1, lims=box_A, u=u, nv=nv)
+    assert diverge_a == 0
+    assert np.allclose(l[:, last_k], l_a[:, last_k])
+    assert np.allclose(L[:, :, last_k], L_a[:, :, last_k])
+
+
 if __name__ == "__main__":
     tests = [test_sx_matches_plain_riccati_when_no_noise_no_filter,
               test_control_law_is_stationary_point_of_its_own_model,
-              test_respects_control_limits]
+              test_respects_control_limits,
+              test_respects_per_timestep_control_limits]
     for t in tests:
         t()
         print(f"PASS: {t.__name__}")

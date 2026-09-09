@@ -107,8 +107,70 @@ def test_converges_and_approximately_matches_lqr():
     )
 
 
+def test_constraint_fn_recomputes_a_tighter_box_each_iteration():
+    """Dastan & Sensinger (2024) extension: an optional constraint_fn
+    should override the fixed box (u_lim_method=1) with a per-timestep
+    one recomputed from the CURRENT nominal trajectory. Uses the SAME
+    linear-quadratic system as test_converges_and_approximately_matches_lqr,
+    but with a constraint_fn that clamps u into a box much tighter than
+    both the LQR-optimal control AND the fixed u_lims -- if constraint_fn
+    is actually wired in, the solution must respect the TIGHT box; if it
+    were silently ignored (e.g. wrong param name swallowed by a stale
+    signature), the solver would instead settle near the wide-box/
+    unconstrained LQR optimum, which this tight box excludes."""
+    rng = np.random.default_rng(0)
+    nx, nu, ny, N = 2, 1, 2, 5
+    dt = 0.1
+    nw, nv = nx, ny
+
+    A, B, F, E, Q, R, dynamics, measurement, cost = make_linear_system(rng, nx, nu, ny)
+
+    x0 = rng.standard_normal(nx)
+    p_hat = np.zeros(0)
+    cov_xa_hat_0 = 1e-2 * np.eye(nx)
+    l0 = np.zeros((nu, N))
+    L0 = np.zeros((nu, nx, N))
+    u_bar0 = np.zeros((nu, N))
+
+    wide_lims = np.array([[-10.0, 10.0]])
+    tight_lims = np.array([[-0.02, 0.02]])
+    calls = []
+
+    def constraint_fn(x_traj, u_traj):
+        assert x_traj.shape == (nx, N)
+        assert u_traj.shape == (nu, N)
+        calls.append(1)
+        return np.tile(tight_lims, (N, 1, 1))
+
+    xa0, u_bar, l, L, lam, dlambda, cost_arr, Pw, Pv, converged = ilqg_function(
+        T=N * dt, dt=dt, x0=x0, l=l0, L=L0, u_bar=u_bar0, lam=1.0, dlambda=1.0,
+        constants=np.zeros(0), p_hat=p_hat, cov_xa_hat_0=cov_xa_hat_0,
+        augment_states=False, reg_type=1, u_lims=wide_lims, ny=ny, nv=nv, nw=nw,
+        max_du_iterations=100, dyn_noise_reg=0.0, tracking_trajectory=None,
+        u_lim_method=1, dynamics=dynamics, measurement=measurement, cost=cost,
+        simulate_system_fn=simulate_system, verbose=False,
+        constraint_fn=constraint_fn)
+
+    assert calls, "constraint_fn was never called"
+    assert np.all(u_bar >= tight_lims[:, 0:1] - 1e-6)
+    assert np.all(u_bar <= tight_lims[:, 1:2] + 1e-6)
+
+    # confirm the tight box is actually binding, not vacuously satisfied --
+    # the SAME system without constraint_fn (wide_lims only) should want a
+    # visibly larger control at some point in the horizon.
+    xa0_wide, u_bar_wide, *_ = ilqg_function(
+        T=N * dt, dt=dt, x0=x0, l=l0, L=L0, u_bar=u_bar0, lam=1.0, dlambda=1.0,
+        constants=np.zeros(0), p_hat=p_hat, cov_xa_hat_0=cov_xa_hat_0,
+        augment_states=False, reg_type=1, u_lims=wide_lims, ny=ny, nv=nv, nw=nw,
+        max_du_iterations=100, dyn_noise_reg=0.0, tracking_trajectory=None,
+        u_lim_method=1, dynamics=dynamics, measurement=measurement, cost=cost,
+        simulate_system_fn=simulate_system, verbose=False)
+    assert np.max(np.abs(u_bar_wide)) > np.max(np.abs(u_bar)) + 1e-3
+
+
 if __name__ == "__main__":
-    tests = [test_converges_and_approximately_matches_lqr]
+    tests = [test_converges_and_approximately_matches_lqr,
+              test_constraint_fn_recomputes_a_tighter_box_each_iteration]
     for t in tests:
         t()
         print(f"PASS: {t.__name__}")
