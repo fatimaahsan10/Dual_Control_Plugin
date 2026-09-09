@@ -5,8 +5,8 @@ import pytest
 
 import wizard.solver_runner as solver_runner_module
 from wizard.schema import (
-    ModelConfig, StateSpec, ActionSpec, ParameterSpec, MeasurementSpec, CostSpec,
-    SolverSettings,
+    ModelConfig, StateSpec, ActionSpec, ParameterSpec, ConstraintSpec,
+    MeasurementSpec, CostSpec, SolverSettings,
 )
 from wizard.solver_runner import run_solver
 
@@ -136,3 +136,84 @@ def test_run_solver_never_raises_on_garbage_config():
     assert not report.ok
     assert isinstance(report.messages, list)
     assert len(report.messages) > 0
+
+
+# ----------------------------------------------------------------------
+# control_method == "ilqr" dispatch (Plan B: generic constraint layer)
+# ----------------------------------------------------------------------
+
+def _small_ilqr_config(constraints=None) -> ModelConfig:
+    return ModelConfig(
+        name="small_ilqr", dt=0.1, n_sessions=6, control_method="ilqr",
+        states=[StateSpec(name="x1", initial_value=-2.0)],
+        actions=[ActionSpec(name="u1", min=-10.0, max=10.0)],
+        dynamics={"x1": "u1"},
+        measurement=[MeasurementSpec(name="y1", expression="x1")],
+        cost=CostSpec(running="x1^2 + 0.001*u1^2", terminal="5*x1^2"),
+        constraints=constraints or [],
+        solver=SolverSettings(first_run_max_du_iterations=30),
+    )
+
+
+def test_ilqr_control_method_runs_end_to_end():
+    report = run_solver(_small_ilqr_config())
+    assert report.ok, report.messages
+    assert report.result is not None
+    for key in ("x_true", "u", "cost_true", "total_true_cost", "trace", "stop_reason"):
+        assert key in report.result
+    assert "x_hat" not in report.result and "p_hat" not in report.result
+    assert np.isfinite(report.result["total_true_cost"])
+
+
+def test_ilqr_structurally_invalid_config_never_reaches_the_solver():
+    config = _small_ilqr_config()
+    config.actions = []
+    report = run_solver(config)
+    assert not report.ok
+    assert report.result is None
+    assert any("action" in m.lower() for m in report.messages)
+
+
+def test_ilqr_bad_constraint_expression_never_reaches_the_solver():
+    config = _small_ilqr_config(constraints=[
+        ConstraintSpec(name="bad", kind="state_action", expression="1 - nonsense_name",
+                        enabled=True)])
+    report = run_solver(config)
+    assert not report.ok
+    assert any("nonsense_name" in m for m in report.messages)
+
+
+def test_ilqr_timeout_is_reported_plainly_and_does_not_raise(monkeypatch):
+    def _slow_solve(*args, **kwargs):
+        time.sleep(5)
+        return {}
+
+    monkeypatch.setattr(solver_runner_module, "solve_ilqr", _slow_solve)
+    start = time.monotonic()
+    report = run_solver(_small_ilqr_config(), timeout_seconds=0.2)
+    waited = time.monotonic() - start
+
+    assert not report.ok
+    assert any("longer than" in m for m in report.messages)
+    assert waited < 4.0
+
+
+def test_ilqr_solver_exception_translated_to_plain_message(monkeypatch):
+    def _raising_solve(*args, **kwargs):
+        raise ValueError("shapes do not align")
+
+    monkeypatch.setattr(solver_runner_module, "solve_ilqr", _raising_solve)
+    report = run_solver(_small_ilqr_config())
+    assert not report.ok
+    assert any("shapes do not align" in m for m in report.messages)
+
+
+def test_ilqr_nan_result_is_caught_and_reported(monkeypatch):
+    def _nan_solve(*args, **kwargs):
+        return {"x_true": np.array([[1.0, np.nan]]), "total_true_cost": 5.0}
+
+    monkeypatch.setattr(solver_runner_module, "solve_ilqr", _nan_solve)
+    report = run_solver(_small_ilqr_config())
+    assert not report.ok
+    assert any("invalid numbers" in m for m in report.messages)
+    assert any("x_true" in m for m in report.messages)

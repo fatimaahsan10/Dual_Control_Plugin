@@ -7,7 +7,8 @@ from wizard.schema import (
 )
 from wizard.solver_runner import run_solver
 from wizard.plotting import (
-    plot_states, plot_actions, plot_parameters, plot_cost, results_table,
+    plot_convergence, plot_states, plot_actions, plot_parameters, plot_cost,
+    results_table,
 )
 
 
@@ -124,3 +125,40 @@ def test_plotting_never_raises_on_malformed_result_shapes():
             (results_table, (malformed, config))):
         result = fn(*args)
         assert result is None or isinstance(result, (Figure, type(None)))
+
+
+# ----------------------------------------------------------------------
+# plot_convergence -- iLQR-only diagnostic (Plan B)
+# ----------------------------------------------------------------------
+
+def _ilqr_config() -> ModelConfig:
+    return ModelConfig(
+        name="plot_test_ilqr", dt=0.1, n_sessions=6, control_method="ilqr",
+        states=[StateSpec(name="x1", initial_value=-2.0)],
+        actions=[ActionSpec(name="u1", min=-10.0, max=10.0)],
+        dynamics={"x1": "u1"},
+        measurement=[MeasurementSpec(name="y1", expression="x1")],
+        cost=CostSpec(running="x1**2 + 0.001*u1**2", terminal="5*x1**2"),
+    )
+
+
+def test_plot_convergence_produced_for_a_real_ilqr_run():
+    report = run_solver(_ilqr_config())
+    assert report.ok, report.messages
+    fig = plot_convergence(report.result)
+    assert isinstance(fig, Figure)
+
+
+def test_plot_convergence_none_for_ilqg_result_with_no_trace():
+    config = _config_without_params()
+    report = run_solver(config)
+    assert report.ok, report.messages
+    assert "trace" not in report.result
+    assert plot_convergence(report.result) is None
+
+
+def test_plot_convergence_empty_or_malformed_returns_none():
+    assert plot_convergence({}) is None
+    assert plot_convergence({"trace": []}) is None
+    assert plot_convergence({"trace": "not a list"}) is None
+    assert plot_convergence({"trace": [{"iter": 1}]}) is None  # no cost/grad_norm keys

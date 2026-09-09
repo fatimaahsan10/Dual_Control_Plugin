@@ -1,0 +1,102 @@
+{
+  "name": "Robot Arm (iLQR + Constraint)",
+  "description": "2-link planar robot arm (same manipulator-equation math as applications/robot_arm_2link/, transcribed into the wizard's own generic equation schema) reaching a fixed joint-space target under iLQR control method. Link 2's mass (m2) is a KNOWN constant here (deterministic, no estimation) -- the same arm's math with m2 as an unknown parameter and control_method 'ilqg' demonstrates dual control instead (see wizard/models/2_Link_Robotic_Arm.json). Demonstrates the generic Wizard's Constraints step (step 5): a single 'state_action' constraint reuses the existing extensions/constraints/ (Dastan & Sensinger 2024) machinery to cap joint-1 torque with a state-DEPENDENT limit that shrinks as the joint speeds up (tau1 <= 28 - 0.5*w1^2), tighter than the plain action bound (tau1 in [-30,30]) whenever the joint is already moving -- not expressible as a static box bound. Action bounds (step 3) are also demonstrated: tau2's own box bound alone already keeps it well inside range for this target, while tau1's box bound is what the constraint further tightens.",
+  "dt": 0.05,
+  "n_sessions": 20,
+  "control_method": "ilqr",
+  "states": [
+    {
+      "name": "q1",
+      "label": "joint 1 angle (rad)",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 1.0
+    },
+    {
+      "name": "q2",
+      "label": "joint 2 angle (rad)",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 1.0
+    },
+    {
+      "name": "w1",
+      "label": "joint 1 angular velocity (rad/s)",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 1.0
+    },
+    {
+      "name": "w2",
+      "label": "joint 2 angular velocity (rad/s)",
+      "initial_value": 0.0,
+      "min": null,
+      "max": null,
+      "process_noise": 1.0
+    }
+  ],
+  "actions": [
+    {
+      "name": "tau1",
+      "label": "joint 1 torque (N*m)",
+      "min": -30.0,
+      "max": 30.0
+    },
+    {
+      "name": "tau2",
+      "label": "joint 2 torque (N*m)",
+      "min": -15.0,
+      "max": 15.0
+    }
+  ],
+  "parameters": [],
+  "constants": [
+    {"name": "l1", "value": 1.0},
+    {"name": "l2", "value": 1.0},
+    {"name": "lc1", "value": 0.5},
+    {"name": "lc2", "value": 0.5},
+    {"name": "m1", "value": 1.0},
+    {"name": "I1", "value": 0.1},
+    {"name": "I2", "value": 0.1},
+    {"name": "g", "value": 9.81},
+    {"name": "fv1", "value": 0.5},
+    {"name": "fv2", "value": 0.5},
+    {"name": "m2", "value": 1.0}
+  ],
+  "dynamics": {
+    "q1": "w1",
+    "q2": "w2",
+    "w1": "((m2*lc2^2 + I2)*(tau1 + m2*l1*lc2*sin(q2)*w1*w2 + m2*l1*lc2*sin(q2)*(w1 + w2)*w2 - ((m1*lc1 + m2*l1)*g*cos(q1) + m2*lc2*g*cos(q1 + q2)) - fv1*w1) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)*(tau2 - m2*l1*lc2*sin(q2)*w1^2 - m2*lc2*g*cos(q1 + q2) - fv2*w2)) / ((m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(m2*lc2^2 + I2) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)^2)",
+    "w2": "(-(m2*(lc2^2 + l1*lc2*cos(q2)) + I2)*(tau1 + m2*l1*lc2*sin(q2)*w1*w2 + m2*l1*lc2*sin(q2)*(w1 + w2)*w2 - ((m1*lc1 + m2*l1)*g*cos(q1) + m2*lc2*g*cos(q1 + q2)) - fv1*w1) + (m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(tau2 - m2*l1*lc2*sin(q2)*w1^2 - m2*lc2*g*cos(q1 + q2) - fv2*w2)) / ((m1*lc1^2 + m2*(l1^2 + lc2^2 + 2*l1*lc2*cos(q2)) + I1 + I2)*(m2*lc2^2 + I2) - (m2*(lc2^2 + l1*lc2*cos(q2)) + I2)^2)"
+  },
+  "measurement": [
+    {"name": "q1", "expression": "q1", "noise_scale": 0.0},
+    {"name": "q2", "expression": "q2", "noise_scale": 0.0},
+    {"name": "w1", "expression": "w1", "noise_scale": 0.0},
+    {"name": "w2", "expression": "w2", "noise_scale": 0.0}
+  ],
+  "cost": {
+    "running": "10*(q1-1.0472)^2 + 10*(q2+0.7854)^2 + w1^2 + w2^2 + 0.01*tau1^2 + 0.01*tau2^2",
+    "terminal": "200*(q1-1.0472)^2 + 200*(q2+0.7854)^2 + 50*w1^2 + 50*w2^2"
+  },
+  "constraints": [
+    {
+      "name": "tau1_speed_derate",
+      "kind": "state_action",
+      "expression": "(28 - 0.5*w1^2) - tau1",
+      "alpha": 1.0,
+      "enabled": true
+    }
+  ],
+  "solver": {
+    "u_lim_method": 1,
+    "reg_type": 1,
+    "max_du_iterations": 60,
+    "first_run_max_du_iterations": 150,
+    "seed": 0
+  },
+  "schema_version": 1
+}

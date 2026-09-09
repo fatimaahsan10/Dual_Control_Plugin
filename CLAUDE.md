@@ -157,12 +157,16 @@ instructions elsewhere in this file still work unchanged.
   orchestration only in app.py; all logic lives in independently-tested 
   modules (schema.py, equation_parser.py, generic_plant.py, storage.py, 
   validation_runner.py, solver_runner.py, plotting.py, 
-  codegen_preview.py), plus models/ (user-saved configs, JSON) and 
-  examples/ (two shipped reference configs reproducing dynamic_pricing/ 
-  and duopoly_pricing/ through the wizard's own generic schema). A NEW, 
-  generic layer that CALLS core/ddp_solver and extensions/dual_control 
-  unmodified — zero changes to either package's protocols.py or any 
-  other file in them.
+  codegen_preview.py, core_ilqr_adapter.py — added 2026-09-09, see 
+  "STATUS — Wizard: iLQR control method + generic constraints" below), 
+  plus models/ (user-saved configs, JSON) and examples/ (three shipped 
+  reference configs: dynamic_pricing/ and duopoly_pricing/ through the 
+  wizard's own generic schema, plus a 2-link robot arm demonstrating the 
+  "ilqr" control method + a generic constraint, both reusing 
+  extensions/constraints/ unmodified). A NEW, generic layer that CALLS 
+  core/ddp_solver and extensions/dual_control (and, for the "ilqr" 
+  control method, extensions/constraints/) unmodified — zero changes to 
+  any of their protocols.py or any other file in them.
 
 ## STATUS — Todorov conversion: COMPLETE ✅
 All core files ported to Python and tested. Now live in 
@@ -1280,6 +1284,185 @@ supervisor-facing distinction between "wants guided questions" and
 
 Total: 127 wizard-specific tests + 134 pre-existing = 261/261 passing, 
 zero regressions.
+
+## STATUS — Wizard: iLQR control method + generic constraints (Plan B): DONE (2026-09-09)
+Adds two capabilities to the wizard, both GENERIC (no robot-arm-specific 
+code anywhere in wizard/*.py) per explicit instruction: (1) a second 
+solver path, `control_method="ilqr"`, routing through 
+core/ddp_solver/ilqg.py directly (deterministic, single full-horizon 
+solve, no estimation) instead of the wizard's existing only path, 
+extensions/dual_control/main_outer_control_loop() (`control_method="ilqg"`, 
+now the explicit default, backward-compatible with every config saved 
+before this field existed); (2) a generic `ConstraintSpec` schema field 
+letting any model attach `h(x,u)>=0` ("state_action") or `h(x)>=0` 
+("state_only", reduced via one Lie derivative) constraints, composed at 
+run time from the EXISTING, UNMODIFIED extensions/constraints/ (Dastan & 
+Sensinger 2024, "Zahid's" work) — confirmed via a dedicated investigation 
+(see chat history) before building anything, per explicit instruction not 
+to build a second constraint system if Zahid's already covers it. Only 
+reachable in "ilqr" mode (main_outer_control_loop() has no constraint_fn 
+hook and is not modified to add one).
+
+**New file: wizard/core_ilqr_adapter.py** — the counterpart to 
+generic_plant.py+main_outer_control_loop() for this path. `build_step_fn`/
+`build_derivs_fn` wrap the SAME `compile_plant()`-produced dynamics/cost 
+closures the iLQG path already uses (augment_states=False, zero 
+dynamics noise) into core/ddp_solver/protocols.py's StepFn/DerivsFn 
+contract, via finite differences (extensions/dual_control/
+finite_difference.py, reused as-is) over dynamics AND a nested 
+finite-difference for the cost Hessian — structurally the SAME pattern 
+extensions/dual_control/forward_pass.py already uses for its own A/B/q/Q/
+r/R/P, minus that module's noise-Jacobian bookkeeping (no filtering in 
+this path). `build_constraint_fn` compiles each enabled `ConstraintSpec` 
+via wizard/equation_parser.py (same sandboxed parser Dynamics/Measurement/
+Cost already use — `state_only` gets a NARROWER allowed-names list, states 
++ constants only, so referencing an action there is a plain parse error, 
+not silently accepted) and calls, verbatim: 
+extensions.constraints.relative_degree_reduction.
+state_constraint_to_control_constraint (state_only rows only) then 
+extensions.constraints.dynamic_control_bounds.build_time_varying_lims 
+(every row, stacked into one combined h_fn — the same "vector h with 
+independent rows" pattern already tested at the library level). 
+`ActionSpec.min/max` become `build_time_varying_lims`'s own `lower`/
+`upper` hard-limit arguments, so action bounds and state-dependent 
+constraints compose through that one existing parameter rather than a 
+new merging step. 
+
+**Plan B refinement over the bare minimum**: since a constraint's 
+expression is already a real sympy tree (same as every wizard equation), 
+`sympy.diff()` supplies an EXACT analytic Jacobian into 
+dynamic_control_bounds.py's/relative_degree_reduction.py's own existing 
+optional `dhdu_fn`/`dhdx_fn` arguments wherever cheaply available (a 
+"state_action" row's own d h/du; a "state_only" row's own d h/dx for its 
+internal Lie-derivative step) — NOT a new constraint algorithm, just a 
+more precise input to an API slot those functions already expose for 
+exactly this purpose. The combined OUTER Jacobian (across possibly-mixed 
+rows) falls back to the library's own numeric differencing whenever any 
+"state_only" row is present (deliberately not attempting to 
+differentiate through the model's own dynamics a second time) — same 
+numeric-fallback code path 
+extensions/constraints/test_relative_degree_reduction.py's own 
+"fully numeric pipeline" test already exercises and verifies.
+
+**RELATIVE-DEGREE LIMITATION, confirmed empirically on the robot arm 
+(not just in the abstract)**: a first attempt at a `state_only` velocity 
+constraint (`w2 >= w_min`) failed at CALL time with 
+`ValueError: ... depends on 2 control channels` — the arm's mass matrix 
+off-diagonal term (M12, generically nonzero) couples BOTH joints' 
+accelerations to BOTH torques, so on a genuinely coupled 2-actuator 
+plant, a Lie derivative of ANY single physical-state constraint (angle or 
+velocity, either joint) touches both `tau1` and `tau2` — not expressible 
+as a box edge under this restriction. The ONLY constraints expressible 
+this way on this plant are ones written directly as a function of ONE 
+control channel. Resolved by choosing a genuinely useful single-channel 
+"state_action" example instead (see below) rather than forcing an 
+ill-fitting demo — `state_only`'s correctness is instead verified on the 
+pendulum-scale toy problem `run_zahid_demo.py` already uses (see tests, 
+below), proving both variants work without misrepresenting which one 
+suits a multi-actuator coupled plant.
+
+**Constraint-warning capture (wizard/validation_runner.py)**: 
+`core/ddp_solver/validate_plugin.validate_constraint_fn` exercises 
+`constraint_fn` on synthetic data but never surfaces a captured 
+`warnings.warn` (e.g. dynamic_control_bounds.py's "relative degree is not 
+one here... silently unenforced" RuntimeWarning) as a `ValidationIssue` — 
+left uncaptured it would print to stderr and never reach the wizard UI, 
+leaving a user unaware a constraint they wrote does nothing. 
+`_validate_ilqr` wraps that call in `warnings.catch_warnings(record=True)`, 
+de-duplicates by message text (`build_time_varying_lims` calls 
+`solve_box_from_constraint` once per trajectory timestep, so the same 
+warning would otherwise repeat dozens of times), and surfaces it as a new 
+`ValidationReport.warnings` field (advisory — doesn't fail validation, 
+since the constraint math itself isn't wrong, only inapplicable at that 
+point) — new `render_validate` UI shows these via `st.warning` even when 
+the model otherwise passes.
+
+**Schema (wizard/schema.py)**: `ModelConfig.control_method: str = "ilqg"` 
+(backward-compatible default); new `ConstraintSpec` dataclass 
+(name/kind/expression/alpha/enabled) + `ModelConfig.constraints` list; 
+`validate()` additions: control_method must be a known value; iLQR needs 
+`n_sessions>=2`; constraint name uniqueness/kind/non-empty-expression/ 
+positive-alpha-for-state_only; an ENABLED constraint requires 
+`control_method="ilqr"` AND `solver.u_lim_method==1` (Box-QP — a 
+tanh-squashed `u` doesn't compose sensibly with a state-dependent box 
+bound computed on the raw, pre-squash control) as a hard, plain-language 
+validate() error rather than a silent no-op.
+
+**UI (wizard/app.py)**: new step "5. Constraints" (all later steps 
+renumbered 6-13), reusing the existing row-editor framework 
+(`_select_row`/`_row_form`) exactly as States/Actions/Parameters/
+Constants/Measurement already do — extended with two small, generic 
+`_Field.kind` additions ("bool" -> checkbox, "select" -> selectbox) that 
+benefit the framework itself, not constraint-specific. `kind`/`expression` 
+live OUTSIDE the form (same reason Measurement's `expression` already 
+does) for live per-keystroke equation feedback against the kind-dependent 
+allowed-names list. New "Control method" radio in "10. Advanced settings". 
+Step 4's parameter list and the new Constraints step both show an inline 
+`st.info`/`st.warning` when the current control_method makes them 
+inapplicable, rather than silently ignoring or blocking data entry. 
+"13. Run & Results" gains an Optimizer stop-reason readout and a new 
+convergence plot (iLQR only).
+
+**New plotting (wizard/plotting.py)**: `plot_convergence(result)` — 
+cost-vs-iteration and gradient-norm-vs-iteration from `ilqg()`'s own 
+`trace`, no equivalent needed/added for the iLQG path (MPC replanning has 
+no single "converged" moment to plot). Every EXISTING plotting function 
+works UNCHANGED for an iLQR result because `solve_ilqr()`'s result dict 
+reuses exactly the iLQG path's key names (`x_true`/`u`/`cost_true`/
+`total_true_cost`), just omitting the estimation-only keys 
+(`x_hat`/`p_hat`/`cost_est`) plotting.py already treats as optional.
+
+**Shipped example: wizard/examples/robot_arm_ilqr_constrained.json** — 
+the SAME 2-link-arm manipulator-equation math already proven in 
+`wizard/models/2_Link_Robotic_Arm.json` (the pre-existing iLQG/dual- 
+control demo, untouched), with link-2 mass `m2` moved from a 
+`ParameterSpec` to a fixed `ConstantSpec` (deterministic iLQR needs no 
+unknown parameter) and one `state_action` constraint: 
+`tau1 <= 28 - 0.5*w1^2` (joint-1 torque allowance shrinks quadratically 
+with the joint's own speed — a motor-derating-style safety constraint, 
+tighter than the plain action bound of ±30 N*m whenever the joint is 
+already moving). Tuned empirically (not guessed): a first attempt at a 
+softer, farther-from-target de-rating value converged only via 
+`EXIT: lambda > lambda_max` (same non-fatal-but-not-"SUCCESS" outcome 
+`run_zahid_demo.py` itself documents); `cap=28, k=0.5, n_sessions=20` 
+converges cleanly (`SUCCESS: gradient norm < tol_grad`, 8 iterations) 
+AND visibly binds for the first ~7 of 20 steps (tau1 flatlines at 
+~27.3-28 N*m, clearly below the ±30 box bound shown on the torque plot) 
+before naturally relaxing as the arm decelerates toward the target — 
+confirmed both by direct script execution and by a full manual run 
+through the real Streamlit app (loaded via "Load an example", stepped 
+through Constraints/Advanced settings/Validate/Run & Results, confirmed 
+the torque plot's visible plateau and the new convergence plot). Final 
+q1=53.1°/q2=-45.8° vs targets 60°/-45° (reasonable given only 20 
+sessions — same order of approach as the existing unconstrained/dual- 
+control demos).
+
+**Tests**: wizard/test_core_ilqr_adapter.py (new, 21 tests) — includes 
+`test_state_only_constraint_matches_zahid_pendulum_closed_form`, which 
+reproduces `run_zahid_demo.py`'s own hand-derived closed form 
+(`alpha*(1-omega) - sin(phi)`) through NOTHING but a wizard 
+`ModelConfig` and `ConstraintSpec`, to 1e-6 — the trust-building proof 
+that the generic composition is equivalent to the hand-wired one, not a 
+different (even if plausible-looking) computation; also covers the 
+two-channel `ValueError` (both at direct call time and as a 
+`PluginContractError` through the real validator), the relative-degree- 
+zero `RuntimeWarning` path, multi-constraint stacking, and action-bound 
+intersection. wizard/test_robot_arm_example.py (new, 5 tests) — 
+including a direct numeric cross-check of the wizard-compiled 
+`continuous_dynamics` against `applications/robot_arm_2link/
+continuous_dynamics.py`'s real function (same "matches real module" 
+convention as test_generic_plant.py's pricing/duopoly checks) and an 
+end-to-end confirmation the shipped constraint actually binds. Existing 
+files extended: test_schema.py (+13), test_solver_runner.py (+7), 
+test_validation_runner.py (+8), test_plotting.py (+3). 
+**Zero changes** to core/ddp_solver/ilqg.py/back_pass.py/forward_pass.py/
+box_qp.py/protocols.py/validate_plugin.py; extensions/dual_control/* 
+(all of it); extensions/constraints/dynamic_control_bounds.py/
+relative_degree_reduction.py (and their tests); applications/
+robot_arm_2link/*; applications/pendulum_constrained/run_zahid_demo.py; 
+wizard/generic_plant.py; wizard/equation_parser.py. 
+Full PYTHON/ suite: 318/318 passing (up from 262 pre-feature), zero 
+regressions.
 
 ## Bugs found during conversion (worth telling supervisor)
 - Latent symmetry bug in original MATLAB's Sxxh computation 

@@ -39,6 +39,21 @@ from typing import Optional
 
 SCHEMA_VERSION = 1
 
+# Which solver drives a model. "ilqg" (default, backward-compatible with
+# every config saved before this field existed) routes through
+# extensions/dual_control/main_outer_control_loop() exactly as today --
+# MPC replanning + SPKF state/parameter estimation every step. "ilqr"
+# routes through core/ddp_solver/ilqg.py instead: one deterministic
+# full-horizon solve, no estimation, no replanning -- see
+# wizard/core_ilqr_adapter.py. Only "ilqr" models can attach constraints
+# (see ConstraintSpec below) -- main_outer_control_loop() has no
+# constraint_fn hook and this project does not modify that shared solver
+# to add one.
+CONTROL_METHODS = ("ilqg", "ilqr")
+
+# ConstraintSpec.kind values -- see ConstraintSpec's own docstring.
+CONSTRAINT_KINDS = ("state_action", "state_only")
+
 # ASCII-only identifier pattern, deliberately stricter than Python's own
 # str.isidentifier() (which permits unicode letters) -- equation_parser.py's
 # character whitelist (its first line of defense against sandbox-escape
@@ -110,6 +125,48 @@ class CostSpec:
 
 
 @dataclass
+class ConstraintSpec:
+    """One inequality constraint h(...) >= 0, enforced only in "ilqr"
+    control-method models (see CONTROL_METHODS above) via
+    wizard/core_ilqr_adapter.py composing the EXISTING, UNMODIFIED
+    extensions/constraints/ (Dastan & Sensinger 2024) machinery -- this
+    schema field does not introduce any new constraint math of its own,
+    only a generic way to describe which of that machinery's two variants
+    a given expression should go through.
+
+    kind == "state_action": `expression` is h(x, u) -- may reference
+        states, actions, and constants. Passed directly to
+        extensions/constraints/dynamic_control_bounds.py's Variant A.
+        `alpha` is unused.
+    kind == "state_only": `expression` is h(x) -- may reference states
+        and constants ONLY (not actions -- enforced at parse time by
+        giving equation_parser.py a narrower name whitelist for this
+        kind, same mechanism schema.py already uses everywhere else).
+        Reduced to a control-dependent constraint via
+        extensions/constraints/relative_degree_reduction.py's Variant B
+        (one Lie derivative + `alpha`-weighted decay, eq 18-19 of the
+        paper) before being handed to Variant A.
+
+    RELATIVE-DEGREE LIMITATION (inherited from the underlying
+    implementation, not introduced here -- see
+    extensions/constraints/dynamic_control_bounds.py's own docstring):
+    a constraint only actually constrains anything if it (or, for
+    kind=="state_only", its Lie derivative) depends on EXACTLY ONE
+    action channel. A row that depends on zero channels is silently left
+    unenforced (a RuntimeWarning is raised deep in that library code);
+    the wizard surfaces this at Validate time rather than letting it pass
+    silently -- see wizard/validation_runner.py. A row depending on TWO OR
+    MORE channels raises a plain-language error at Validate/Run time
+    instead of producing a wrong bound.
+    """
+    name: str
+    kind: str = "state_only"
+    expression: str = ""
+    alpha: float = 1.0
+    enabled: bool = True
+
+
+@dataclass
 class SolverSettings:
     """
     NOTE: augment_states_in_ilqg/augment_states_in_filter are
@@ -159,6 +216,7 @@ class ModelConfig:
     description: str = ""
     dt: float = 1.0
     n_sessions: int = 15
+    control_method: str = "ilqg"
     states: list[StateSpec] = field(default_factory=list)
     actions: list[ActionSpec] = field(default_factory=list)
     parameters: list[ParameterSpec] = field(default_factory=list)
@@ -166,6 +224,7 @@ class ModelConfig:
     dynamics: dict[str, str] = field(default_factory=dict)  # state name -> expression
     measurement: list[MeasurementSpec] = field(default_factory=list)
     cost: CostSpec = field(default_factory=CostSpec)
+    constraints: list[ConstraintSpec] = field(default_factory=list)
     solver: SolverSettings = field(default_factory=SolverSettings)
     schema_version: int = SCHEMA_VERSION
 
@@ -190,6 +249,9 @@ class ModelConfig:
     def all_defined_names(self) -> list[str]:
         return (self.state_names() + self.action_names()
                 + self.parameter_names() + self.constant_names())
+
+    def constraint_names(self) -> list[str]:
+        return [c.name for c in self.constraints]
 
     @property
     def nx(self) -> int:
@@ -338,6 +400,52 @@ class ModelConfig:
             errors.append("The terminal cost expression is empty (use '0' "
                            "if there's no separate terminal cost).")
 
+        if self.control_method not in CONTROL_METHODS:
+            errors.append(
+                f"Control method must be one of {CONTROL_METHODS}, got "
+                f"'{self.control_method}'.")
+        elif (self.control_method == "ilqr" and isinstance(self.n_sessions, int)
+                and self.n_sessions < 2):
+            errors.append(
+                "iLQR control method needs at least 2 steps to simulate "
+                "(one state to start from, at least one control step).")
+
+        constraint_names_seen: set[str] = set()
+        for c in self.constraints:
+            if not c.name or not str(c.name).strip():
+                errors.append("Every constraint needs a name.")
+            elif c.name in constraint_names_seen:
+                errors.append(f"The constraint name '{c.name}' is used more "
+                               f"than once -- constraint names must be unique.")
+            else:
+                constraint_names_seen.add(c.name)
+            if c.kind not in CONSTRAINT_KINDS:
+                errors.append(
+                    f"Constraint '{c.name}': kind must be one of "
+                    f"{CONSTRAINT_KINDS}, got '{c.kind}'.")
+            if not c.expression or not str(c.expression).strip():
+                errors.append(f"Constraint '{c.name}': the expression is empty.")
+            if c.kind == "state_only":
+                if not isinstance(c.alpha, (int, float)) or c.alpha <= 0:
+                    errors.append(
+                        f"Constraint '{c.name}': alpha must be a positive "
+                        f"number for a state-only constraint (it controls "
+                        f"how quickly the constraint's own reduction term "
+                        f"decays -- see extensions/constraints/"
+                        f"relative_degree_reduction.py).")
+        if self.constraints and any(c.enabled for c in self.constraints):
+            if self.control_method != "ilqr":
+                errors.append(
+                    "Constraints are only enforced in iLQR control method -- "
+                    "switch Control method to iLQR, or disable/remove the "
+                    "constraint(s), to proceed.")
+            elif self.solver.u_lim_method != 1:
+                errors.append(
+                    "Constraints require the 'Box-QP' bound enforcement "
+                    "method (Advanced settings) -- the tanh-squash method "
+                    "doesn't compose sensibly with state-dependent control "
+                    "bounds.")
+
         s = self.solver
         if s.u_lim_method not in (1, 2):
             errors.append("Advanced setting 'bound enforcement method' must "
@@ -370,12 +478,14 @@ class ModelConfig:
         constants = [ConstantSpec(**c) for c in d.get("constants", [])]
         measurement = [MeasurementSpec(**m) for m in d.get("measurement", [])]
         cost = CostSpec(**d.get("cost", {}))
+        constraints = [ConstraintSpec(**c) for c in d.get("constraints", [])]
         solver = SolverSettings(**d.get("solver", {}))
         return cls(
             name=d.get("name", ""),
             description=d.get("description", ""),
             dt=d.get("dt", 1.0),
             n_sessions=d.get("n_sessions", 15),
+            control_method=d.get("control_method", "ilqg"),
             states=states,
             actions=actions,
             parameters=parameters,
@@ -383,6 +493,7 @@ class ModelConfig:
             dynamics=dict(d.get("dynamics", {})),
             measurement=measurement,
             cost=cost,
+            constraints=constraints,
             solver=solver,
             schema_version=d.get("schema_version", SCHEMA_VERSION),
         )

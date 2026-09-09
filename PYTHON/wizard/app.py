@@ -60,12 +60,14 @@ import streamlit as st
 from wizard.codegen_preview import generate_all_previews
 from wizard.equation_parser import ALLOWED_FUNCTIONS, check_equation_live
 from wizard.plotting import (
-    plot_actions, plot_cost, plot_parameters, plot_states, results_table,
+    plot_actions, plot_convergence, plot_cost, plot_parameters, plot_states,
+    results_table,
 )
 from wizard.schema import (
-    MAX_DU_ITERATIONS, MAX_FIRST_RUN_DU_ITERATIONS, MAX_N_SESSIONS,
-    ActionSpec, ConstantSpec, MeasurementSpec, ModelConfig, ParameterSpec,
-    StateSpec,
+    CONSTRAINT_KINDS, CONTROL_METHODS, MAX_DU_ITERATIONS,
+    MAX_FIRST_RUN_DU_ITERATIONS, MAX_N_SESSIONS,
+    ActionSpec, ConstantSpec, ConstraintSpec, MeasurementSpec, ModelConfig,
+    ParameterSpec, StateSpec,
 )
 from wizard.solver_runner import run_solver
 from wizard.storage import (
@@ -76,9 +78,9 @@ from wizard.validation_runner import run_validation
 
 STEP_NAMES = [
     "1. Basics", "2. States", "3. Actions", "4. Unknown parameters",
-    "5. Constants", "6. Dynamics", "7. Measurement", "8. Cost",
-    "9. Advanced settings", "10. Review & Save", "11. Validate",
-    "12. Run & Results",
+    "5. Constraints", "6. Constants", "7. Dynamics", "8. Measurement",
+    "9. Cost", "10. Advanced settings", "11. Review & Save", "12. Validate",
+    "13. Run & Results",
 ]
 
 
@@ -93,7 +95,8 @@ def _init_state() -> None:
 # Step-2..7 tables built with _select_row/_row_form below; each keeps its
 # own "which row is selected" widget key in session_state (see
 # `_reset_row_editor_state`).
-_ROW_TABLE_NAMES = ["states", "actions", "parameters", "constants", "measurement"]
+_ROW_TABLE_NAMES = ["states", "actions", "parameters", "constraints",
+                    "constants", "measurement"]
 
 
 def _reset_row_editor_state() -> None:
@@ -167,14 +170,16 @@ def _equation_syntax_caption(all_names: list[str]) -> None:
 @dataclass(frozen=True)
 class _Field:
     """One editable field in a _row_form. `kind` is "text", "float" (a
-    plain required number), or "optional_float" (a number_input that can
+    plain required number), "optional_float" (a number_input that can
     be left blank, returning None -- for Optional[float] dataclass
-    fields)."""
+    fields), "bool" (a checkbox), or "select" (a selectbox restricted to
+    `options`, added for ConstraintSpec.kind -- see render_constraints)."""
     attr: str
     label: str
     kind: str
     min_value: float | None = None
     help: str | None = None
+    options: tuple | None = None
 
 
 def _select_row(items: list, key_prefix: str) -> int | None:
@@ -237,6 +242,14 @@ def _row_form(
             if f.kind == "text":
                 values[f.attr] = st.text_input(
                     f.label, value=default or "", key=widget_key, help=f.help)
+            elif f.kind == "bool":
+                values[f.attr] = st.checkbox(
+                    f.label, value=bool(default), key=widget_key, help=f.help)
+            elif f.kind == "select":
+                opts = list(f.options)
+                idx_ = opts.index(default) if default in opts else 0
+                values[f.attr] = st.selectbox(
+                    f.label, options=opts, index=idx_, key=widget_key, help=f.help)
             else:
                 values[f.attr] = st.number_input(
                     f.label, value=default, min_value=f.min_value,
@@ -467,6 +480,13 @@ def render_parameters(cfg: ModelConfig) -> None:
         "Is there anything in your system whose true value you don't "
         "know, but want the controller to learn from data as it runs? "
         "It's fine to have none.")
+    if cfg.control_method == "ilqr" and cfg.parameters:
+        st.info(
+            "Control method is currently iLQR (Advanced settings), which "
+            "has no online estimation -- any parameter defined here is "
+            "used at its fixed 'best initial guess' value instead of "
+            "being learned. Switch Control method to iLQG / Dual Control "
+            "to have the controller estimate it from data.")
 
     idx = _select_row(cfg.parameters, "parameters")
     _row_form(cfg, cfg.parameters, ParameterSpec, _PARAMETER_FIELDS,
@@ -474,7 +494,82 @@ def render_parameters(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 5: Constants
+# Step 5: Constraints
+# ----------------------------------------------------------------------
+
+_CONSTRAINT_KIND_OPTIONS = [
+    ("state_action", "h(x, u) >= 0  --  may use states, actions, constants"),
+    ("state_only", "h(x) >= 0  --  states and constants only "
+                    "(reduced via a Lie derivative + alpha)"),
+]
+
+_CONSTRAINT_FIELDS = [
+    _Field("name", "Name", "text"),
+    _Field("alpha", "Alpha", "float", min_value=1e-9,
+           help="Only used by an h(x) >= 0 constraint -- controls how "
+                "quickly its reduction term decays (Dastan & Sensinger "
+                "2024, eq 18-19). Ignored for an h(x, u) >= 0 constraint."),
+    _Field("enabled", "Enabled", "bool"),
+]
+
+
+def render_constraints(cfg: ModelConfig) -> None:
+    st.header("5. Constraints")
+    st.write(
+        "Optionally require h(...) >= 0 to hold throughout the run, "
+        "enforced through the existing constrained-DDP extension "
+        "(Dastan & Sensinger 2024, see extensions/constraints/) -- no new "
+        "constraint math, just a generic way to describe one. It's fine "
+        "to have none. Action bounds (step 3) always apply regardless.")
+    st.caption(
+        "**Only enforced in iLQR control method** (Advanced settings, "
+        "step 10) -- iLQG / Dual Control has no hook for this. A "
+        "constraint only actually restricts anything if it (or, for an "
+        "h(x) constraint, its Lie derivative) depends on exactly one "
+        "action -- Test This Model will warn you if a constraint you "
+        "wrote turns out not to.")
+
+    if (cfg.control_method != "ilqr" and cfg.constraints
+            and any(c.enabled for c in cfg.constraints)):
+        st.warning(
+            "Control method is currently iLQG / Dual Control -- these "
+            "constraint(s) will be rejected at Validate time until you "
+            "either switch Control method to iLQR (Advanced settings) or "
+            "disable/remove them.", icon="⚠️")
+
+    idx = _select_row(cfg.constraints, "constraints")
+    current = cfg.constraints[idx] if idx is not None else None
+
+    kind_key = f"constraints_{idx}_kind"
+    kind_values = [k for k, _ in _CONSTRAINT_KIND_OPTIONS]
+    kind_labels = dict(_CONSTRAINT_KIND_OPTIONS)
+    kind = st.selectbox(
+        "Kind", options=kind_values,
+        index=kind_values.index(current.kind) if current and current.kind in kind_values else 0,
+        format_func=lambda k: kind_labels[k], key=kind_key)
+
+    if kind == "state_action":
+        allowed_names = cfg.state_names() + cfg.action_names() + cfg.constant_names()
+    else:
+        allowed_names = cfg.state_names() + cfg.constant_names()
+    st.caption(
+        f"Known names for this constraint: {', '.join(allowed_names) or '(none defined yet)'}. "
+        f"Write h so that h >= 0 is the condition you want to hold.")
+
+    expr_key = f"constraints_{idx}_expression"
+    expression = st.text_input(
+        "Expression (h)", value=current.expression if current else "",
+        key=expr_key)
+    _show_equation_feedback(expression, allowed_names)
+
+    _row_form(cfg, cfg.constraints, ConstraintSpec, _CONSTRAINT_FIELDS,
+              "constraints", idx,
+              extra_values={"kind": kind, "expression": expression},
+              extra_keys_to_clear=[kind_key, expr_key])
+
+
+# ----------------------------------------------------------------------
+# Step 6: Constants
 # ----------------------------------------------------------------------
 
 _CONSTANT_FIELDS = [
@@ -484,7 +579,7 @@ _CONSTANT_FIELDS = [
 
 
 def render_constants(cfg: ModelConfig) -> None:
-    st.header("5. Constants")
+    st.header("6. Constants")
     st.write("Any other fixed, known numbers your equations need?")
 
     idx = _select_row(cfg.constants, "constants")
@@ -492,11 +587,11 @@ def render_constants(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 6: Dynamics
+# Step 7: Dynamics
 # ----------------------------------------------------------------------
 
 def render_dynamics(cfg: ModelConfig) -> None:
-    st.header("6. Dynamics")
+    st.header("7. Dynamics")
     all_names = cfg.all_defined_names()
     _equation_syntax_caption(all_names)
 
@@ -513,7 +608,7 @@ def render_dynamics(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 7: Measurement
+# Step 8: Measurement
 # ----------------------------------------------------------------------
 
 _MEASUREMENT_FIELDS = [
@@ -523,7 +618,7 @@ _MEASUREMENT_FIELDS = [
 
 
 def render_measurement(cfg: ModelConfig) -> None:
-    st.header("7. Measurement")
+    st.header("8. Measurement")
     st.write("What can actually be observed/measured about your system?")
     all_names = cfg.all_defined_names()
     _equation_syntax_caption(all_names)
@@ -547,11 +642,11 @@ def render_measurement(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 8: Cost
+# Step 9: Cost
 # ----------------------------------------------------------------------
 
 def render_cost(cfg: ModelConfig) -> None:
-    st.header("8. Cost")
+    st.header("9. Cost")
     st.write(
         "Write an expression that should be SMALL when things are going "
         "well and LARGE when they're going badly -- this is what the "
@@ -579,11 +674,27 @@ def render_cost(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 9: Advanced settings
+# Step 10: Advanced settings
 # ----------------------------------------------------------------------
 
+_CONTROL_METHOD_LABELS = {
+    "ilqg": "iLQG / Dual Control -- estimates unknown parameters online "
+             "while controlling (MPC replanning every step)",
+    "ilqr": "iLQR -- one deterministic full-horizon solve, no estimation "
+             "(required for step 5's constraints)",
+}
+
+
 def render_advanced(cfg: ModelConfig) -> None:
-    st.header("9. Advanced settings")
+    st.header("10. Advanced settings")
+
+    cfg.control_method = st.radio(
+        "Control method", options=list(CONTROL_METHODS),
+        index=list(CONTROL_METHODS).index(cfg.control_method)
+        if cfg.control_method in CONTROL_METHODS else 0,
+        format_func=lambda m: _CONTROL_METHOD_LABELS[m], key="adv_control_method")
+    st.divider()
+
     s = cfg.solver
 
     method_options = [1, 2]
@@ -614,11 +725,11 @@ def render_advanced(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 10: Review & Save
+# Step 11: Review & Save
 # ----------------------------------------------------------------------
 
 def render_review(cfg: ModelConfig) -> None:
-    st.header("10. Review & Save")
+    st.header("11. Review & Save")
 
     errors = cfg.validate()
     if errors:
@@ -658,11 +769,11 @@ def render_review(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 11: Validate
+# Step 12: Validate
 # ----------------------------------------------------------------------
 
 def render_validate(cfg: ModelConfig) -> None:
-    st.header("11. Validate")
+    st.header("12. Validate")
     st.write(
         "This checks your equations and settings against sample numbers "
         "before anything touches the real solver.")
@@ -681,6 +792,8 @@ def render_validate(cfg: ModelConfig) -> None:
             st.info("The model has changed since this result -- test again.")
         if report.ok:
             st.success("Model passed all checks. You can proceed to Run & Results.")
+            for w in report.warnings:
+                st.warning(w, icon="⚠️")
         else:
             st.error("Problems found:")
             for m in report.messages:
@@ -691,11 +804,11 @@ def render_validate(cfg: ModelConfig) -> None:
 
 
 # ----------------------------------------------------------------------
-# Step 12: Run & Results
+# Step 13: Run & Results
 # ----------------------------------------------------------------------
 
 def render_run(cfg: ModelConfig) -> None:
-    st.header("12. Run & Results")
+    st.header("13. Run & Results")
 
     sig = _config_signature(cfg)
     validated_ok = (st.session_state.validation_report is not None
@@ -703,7 +816,7 @@ def render_run(cfg: ModelConfig) -> None:
                      and st.session_state.validated_config_signature == sig)
     if not validated_ok:
         st.warning(
-            "Please pass validation (step 11) first -- and re-validate if "
+            "Please pass validation (step 12) first -- and re-validate if "
             "you changed anything since.")
 
     if st.button("Run Simulation", key="run_btn", disabled=not validated_ok):
@@ -737,6 +850,22 @@ def render_run(cfg: ModelConfig) -> None:
         f"Completed in {report.elapsed_seconds:.1f}s. "
         f"Total cost over the run: {result['total_true_cost']:.4g}")
 
+    if "stop_reason" in result:  # iLQR only -- iLQG's MPC loop has no single "converged" moment
+        stop_reason = result["stop_reason"]
+        if isinstance(stop_reason, str) and stop_reason.startswith("SUCCESS"):
+            st.info(f"Optimizer: {stop_reason}")
+        else:
+            st.warning(
+                f"Optimizer: {stop_reason}. This does not necessarily mean "
+                f"the result below is unusable -- check the trajectory and "
+                f"convergence plots; a constrained problem can make real "
+                f"progress and still end this way (see the 'EXIT: lambda > "
+                f"lambda_max' discussion in applications/"
+                f"pendulum_constrained/run_zahid_demo.py).")
+
+    fig = plot_convergence(result)
+    if fig is not None:
+        st.pyplot(fig)
     fig = plot_states(result, cfg)
     if fig is not None:
         st.pyplot(fig)
@@ -765,8 +894,8 @@ def render_run(cfg: ModelConfig) -> None:
 
 RENDERERS = [
     render_basics, render_states, render_actions, render_parameters,
-    render_constants, render_dynamics, render_measurement, render_cost,
-    render_advanced, render_review, render_validate, render_run,
+    render_constraints, render_constants, render_dynamics, render_measurement,
+    render_cost, render_advanced, render_review, render_validate, render_run,
 ]
 
 
