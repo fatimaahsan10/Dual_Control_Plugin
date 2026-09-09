@@ -21,6 +21,18 @@ DEVIATION FROM THE LITERAL MATLAB SOURCE: dynamics/measurement/cost/
 simulate_system are explicit callables here rather than hardcoded calls to
 the SIDARTHE-specific functions, matching forward_pass.py's/
 todorov_estimator.py's/simulate_system.py's own convention.
+
+Optional `constraint_fn` param (Dastan & Sensinger 2024 extension, see
+extensions/constraints/dynamic_control_bounds.py and
+relative_degree_reduction.py): the same per-outer-iteration state-
+dependent box bound already added to core/ddp_solver/ilqg.py for the
+"ilqr" control method (see that module's own docstring), now also
+available to this dual/adaptive-control inner loop. backward_pass.py was
+extended to accept the resulting per-timestep bound shape (N-1,m,2)
+alongside its existing fixed (m,2) shape; forward_pass.py needed no
+change at all, since (see ilqg_function's own docstring on this
+parameter) the line search here never explicitly clips against a box in
+the first place -- unlike core/ddp_solver/forward_pass.py, which does.
 """
 
 import numpy as np
@@ -34,7 +46,7 @@ def ilqg_function(T, dt, x0, l, L, u_bar, lam, dlambda, constants, p_hat,
                     cov_xa_hat_0, augment_states, reg_type, u_lims, ny, nv,
                     nw, max_du_iterations, dyn_noise_reg, tracking_trajectory,
                     u_lim_method, dynamics, measurement, cost,
-                    simulate_system_fn, verbose=False):
+                    simulate_system_fn, verbose=False, constraint_fn=None):
     """
     Returns
     -------
@@ -49,6 +61,36 @@ def ilqg_function(T, dt, x0, l, L, u_bar, lam, dlambda, constants, p_hat,
                here
     converged : 0 not converged, 1 gradient, 2 cost, 3 max iters,
                 -1 lambda > lambda_max
+
+    constraint_fn : callable(x_traj, u_traj) -> (N,m,2) ndarray, or None
+                (Dastan & Sensinger 2024 extension, same hook
+                core/ddp_solver/ilqg.py already has -- see that module's
+                own docstring). Recomputed once per SOLVE iteration, right
+                after the forward pass re-differentiates (i.e. whenever
+                `flg_change` is True, mirroring core ilqg.py's own
+                `flg_change`-gated recompute), from the CURRENT nominal
+                PHYSICAL-state trajectory `xa_bar[:nx, :N]` (never the
+                augmented parameter block, if `augment_states` -- a
+                constraint written against this model's own named states
+                has no notion of the estimator's internal augmented
+                dimensions) and `u_bar`. Substituted for `u_lims` in the
+                box-QP bound passed to backward_pass() ONLY --
+                only meaningful when `u_lim_method == 1` (Box-QP); a
+                tanh-squashed control (u_lim_method == 2) has no box for
+                this to replace, so `constraint_fn` is ignored in that
+                case (same restriction wizard/schema.py's ModelConfig.
+                validate() already enforces for the "ilqr" control
+                method). The nominal-rollout call a few lines below
+                (`xa0.ndim == 1` branch) and the line-search loop always
+                use the fixed `u_lims`, never `constraint_fn` -- same
+                convention as core ilqg.py's initial divergence-avoiding
+                rollout, and consistent with this function's PRE-EXISTING
+                behaviour for the plain (m,2) box case: the line search
+                here has never explicitly clipped `u` against `u_lims`
+                either, relying entirely on backward_pass()'s box-QP
+                having already produced feasible gains -- a state-
+                dependent box rides on that same, already-soft
+                enforcement, no stronger and no weaker than before.
     """
     full_DDP = False
     dlambda_0 = 1.6
@@ -106,6 +148,8 @@ def ilqg_function(T, dt, x0, l, L, u_bar, lam, dlambda, constants, p_hat,
                 tracking_trajectory, u_lims, u_lim_method)
             cost_arr = cost(xa_bar, u_aug, tracking_trajectory, u_lims,
                               u_lim_method, constants)
+            if constraint_fn is not None and u_lim_method == 1:
+                u_lims_boxqp = constraint_fn(xa_bar[:nx, :N], u_bar)
             flg_change = False
             if verbose:
                 print("Forward pass complete")

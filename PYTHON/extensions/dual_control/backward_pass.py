@@ -49,7 +49,16 @@ def backward_pass(A, B, c, Cx, Cu, d, Dx, Du, E, F, K, fxx, fxu, fuu,
     fxx,fxu,fuu : None (full_DDP path unimplemented, see forward_pass.py)
     q0,q,Q,r,R,P : cost derivatives, as returned by forward_pass.py
     lam, reg_type : regularization strength / scheme (1-4)
-    lims      : (m,2) control bounds or None
+    lims      : control bounds, or None. Either (m,2) [one fixed box for
+                the whole horizon] or (N-1,m,2) [per-timestep box,
+                lims[k] applying at control step k -- Dastan & Sensinger
+                (2024)'s state-dependent constraint extension, same
+                per-timestep shape core/ddp_solver/back_pass.py already
+                accepts; produced by e.g. extensions/constraints/
+                dynamic_control_bounds.build_time_varying_lims()]. The
+                "lims[0,0] > lims[0,1]" unconstrained sentinel below only
+                applies to the (m,2) case -- it never meant anything for
+                a per-timestep array; pass lims=None instead.
     u         : (m,N) current nominal controls (box-constraint offset)
     nv        : number of measurement noise channels
     return_internals : if True, also return a dict of Sx/Sxh/Sxxh/sx/sxh/
@@ -170,7 +179,8 @@ def backward_pass(A, B, c, Cx, Cu, d, Dx, Du, E, F, K, fxx, fxu, fuu,
             H_reg = H_w_S_reg
 
         # ---- solve for the control law ----
-        no_limits = lims is None or np.size(lims) == 0 or lims[0, 0] > lims[0, 1]
+        no_limits = lims is None or np.size(lims) == 0 or (
+            lims.ndim == 2 and lims[0, 0] > lims[0, 1])
 
         if no_limits:
             try:
@@ -192,8 +202,9 @@ def backward_pass(A, B, c, Cx, Cu, d, Dx, Du, E, F, K, fxx, fxu, fuu,
                 return (diverge, l, L, s0_alpha) if not return_internals else (
                     diverge, l, L, s0_alpha, None)
 
-            lower = lims[:, 0] - u[:, k]
-            upper = lims[:, 1] - u[:, k]
+            lims_k = lims if lims.ndim == 2 else lims[k]
+            lower = lims_k[:, 0] - u[:, k]
+            upper = lims_k[:, 1] - u[:, k]
             warm_start = l[:, min(k + 1, N - 2)]
             l_i, result, Lc, free = box_qp(H_reg, g, lower, upper, warm_start)
             if result < 1:

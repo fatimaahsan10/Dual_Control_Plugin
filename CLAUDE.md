@@ -1464,6 +1464,153 @@ wizard/generic_plant.py; wizard/equation_parser.py.
 Full PYTHON/ suite: 318/318 passing (up from 262 pre-feature), zero 
 regressions.
 
+## STATUS — Wizard: constraint_fn hook added to the iLQG/dual-control path: DONE (2026-09-09)
+Follow-on to the Plan B entry directly above. That entry's constraint 
+feature only worked under `control_method="ilqr"` because 
+`extensions/dual_control/main_outer_control_loop()` had no `constraint_fn` 
+hook at all -- meaning a model could either LEARN an unknown parameter 
+(dual control, "ilqg") or attach a state-dependent CONSTRAINT ("ilqr"), 
+never both on the same model (e.g. the robot arm: learning `m2` vs. 
+constraining `tau1` were mutually exclusive). Investigated feasibility 
+first (checked back_pass.py's/forward_pass.py's/ilqg.py's own Zahid-era 
+`constraint_fn` extension for exactly what would need to mirror across to 
+the dual-control side), confirmed it was additive and backward-compatible, 
+then built it, per explicit instruction.
+
+**extensions/dual_control/backward_pass.py**: `lims` may now be (m,2) 
+[original] or (N-1,m,2) [per-timestep, Dastan & Sensinger] -- identical 
+`ndim`-branch mechanism already used by core/ddp_solver/back_pass.py: the 
+"lims[0,0]>lims[0,1]" unconstrained sentinel now only applies when 
+`lims.ndim==2`, and `lims_k = lims if lims.ndim==2 else lims[k]` selects 
+the per-timestep row before building the box-QP bounds.
+
+**extensions/dual_control/ilqg_function.py**: new optional `constraint_fn` 
+parameter (trailing, default `None` -- every pre-existing positional call 
+site is unaffected). Recomputed once per SOLVE iteration inside the 
+existing `if flg_change:` block (same gating Zahid's core/ddp_solver/ 
+ilqg.py extension already uses), from the CURRENT nominal trajectory's 
+PHYSICAL states only -- `xa_bar[:nx, :N]`, deliberately excluding the 
+augmented-parameter block of `xa_bar` when `augment_states=True`, since a 
+constraint written against this model's own named states has no notion 
+of the estimator's internal augmented dimensions. Only applied when 
+`u_lim_method==1` (Box-QP), matching the existing restriction. 
+`extensions/dual_control/forward_pass.py` needed ZERO changes: unlike 
+core/ddp_solver/forward_pass.py, this module's own line search (inside 
+ilqg_function.py, not a separate forward_pass.py call) has never 
+explicitly clipped `u` against a box in the first place -- it relies 
+entirely on backward_pass()'s box-QP having already produced feasible 
+gains, a PRE-EXISTING property of the plain (m,2) box case too, not a new 
+limitation introduced here. A state-dependent box rides on that same 
+already-soft enforcement, no stronger and no weaker than before.
+
+**extensions/dual_control/main_outer_control_loop.py**: new optional 
+`constraint_fn` parameter, forwarded unchanged to every session's 
+`ilqg_function()` call -- pure pass-through, no logic of its own.
+
+**wizard/schema.py**: dropped the "constraints only enforced in iLQR 
+control method" hard error -- an enabled constraint now only requires 
+`u_lim_method==1`, regardless of `control_method`. Updated the module- 
+level `CONTROL_METHODS`/`ConstraintSpec` comments accordingly (they 
+previously stated, now incorrectly, that `main_outer_control_loop()` had 
+no `constraint_fn` hook and that this project would not add one).
+
+**wizard/core_ilqr_adapter.py**: `build_constraint_fn()` needed ZERO 
+functional changes -- it was already control-method-agnostic (plain 
+`callable(x_traj, u_traj) -> (N,m,2)`), so `wizard/solver_runner.py`'s 
+"ilqg" branch now simply calls the SAME function the "ilqr" branch 
+already used. Docstring updated to flag the one real asymmetry this reuse 
+carries: a `"state_only"` constraint's Lie-derivative reduction (via 
+`_build_plain_continuous_dynamics`) always evaluates continuous dynamics 
+at each unknown parameter's FIXED prior/true value 
+(`plant.constants.prior`), never at the "ilqg" path's evolving online 
+estimate `p_hat` -- correctly re-deriving the reduction from the current 
+`p_hat` every session would mean threading `p_hat` into 
+`build_constraint_fn()` from inside the outer loop itself, a bigger 
+change deliberately left out of this scope and flagged rather than 
+silently accepted. A `"state_action"` constraint is entirely unaffected 
+(no dynamics/Lie-derivative step involved at all).
+
+**wizard/solver_runner.py** (`_run_ilqg`): now calls 
+`build_constraint_fn(plant, config)` (catching the same 
+`ConstraintCompilationError` the "ilqr" branch already catches) and passes 
+the result into `main_outer_control_loop(..., constraint_fn=...)`.
+
+**wizard/validation_runner.py** (`_validate_ilqg`): now also builds and 
+checks `constraint_fn` via `core/ddp_solver/validate_plugin.
+validate_constraint_fn()` (that function's contract is control-method- 
+agnostic, so reused directly rather than duplicated) and raises 
+`PluginContractError` on any issue found -- `validate_constraint_fn()` 
+itself only returns a list of issues, unlike `validate_core_plugin()` 
+which raises for you, so `_validate_ilqg` raises explicitly (matching 
+`validate_core_plugin`'s own convention). Same RuntimeWarning-capture-and- 
+deduplicate advisory pattern `_validate_ilqr` already used, factored into 
+a shared `_dedup_constraint_warnings()` helper rather than duplicated.
+
+**wizard/app.py**: removed the "Control method is currently iLQG / Dual 
+Control -- these constraint(s) will be rejected..." warning block (no 
+longer true) and the "(required for step 5's constraints)" iLQR radio- 
+button label suffix (also no longer true); Constraints step caption now 
+reads "Works with either Control method" and separately notes the 
+prior-vs-estimate caveat above for a `state_only` constraint on a model 
+with unknown parameters.
+
+**VERIFIED END-TO-END on the real motivating case** (not hypothetical): 
+loaded the EXISTING `wizard/models/2_Link_Robotic_Arm.json` (the 
+dual-control robot arm that learns `m2` from a deliberately wrong prior, 
+0.3 vs. true 1.0 -- see "Repository layout" above), added ONE 
+`state_action` constraint identical in spirit to the "ilqr"-only shipped 
+example (`(28 - 0.5*w1^2) - tau1`, a speed-derated torque cap tighter than 
+the plain ±30 N·m action bound), and ran it through `run_solver()` 
+unmodified. Result: `m2_hat` still converges 0.3 -> 1.037 (true 1.0, same 
+qualitative learning behaviour as before this change), AND `tau1` visibly 
+respects the derating -- caps at exactly 28.0 N·m (below the 30 N·m box 
+bound) for the first several sessions while `w1` is large, exactly the 
+same binding pattern the "ilqr"-only shipped example already 
+demonstrated. This is the first model in the codebase where dual-control 
+parameter LEARNING and a state-dependent CONSTRAINT operate together, 
+confirming the two capabilities (previously mutually exclusive by 
+construction) now genuinely compose.
+
+**Tests**: extensions/dual_control/test_backward_pass.py 
+(+test_respects_per_timestep_control_limits, mirroring core/ddp_solver's 
+own per-timestep box test, including a same-box-different-index exact- 
+match check limited to the one recursion step -- k=N-2 -- that provably 
+can't be influenced by any other timestep's box choice); 
+test_ilqg_function.py (+test_constraint_fn_recomputes_a_tighter_box_each_
+iteration, confirming the tight box both applies AND is non-vacuous by 
+comparing against the same system solved with only the wide fixed box); 
+test_main_outer_control_loop.py (+test_constraint_fn_threads_through_to_
+every_session, same non-vacuous-binding check at the outer MPC-loop 
+level). wizard/test_schema.py: replaced the now-obsolete 
+`test_enabled_constraint_requires_ilqr_control_method`/
+`test_disabled_constraint_does_not_require_ilqr` with 
+`test_enabled_constraint_allowed_under_ilqg_control_method` and extended 
+`test_enabled_constraint_requires_box_qp_bound_method` to check BOTH 
+control methods. wizard/test_solver_runner.py 
+(+test_ilqg_with_constraint_runs_end_to_end_and_actually_binds -- same 
+non-vacuous-binding convention as the extensions/dual_control tests above, 
+run through the real wizard solver dispatch on `_small_config()`'s 
+pricing-like plant; +test_ilqg_bad_constraint_expression_never_reaches_
+the_solver; +test_ilqg_constraint_with_tanh_squash_is_rejected_before_
+solving). wizard/test_validation_runner.py 
+(+test_valid_ilqg_state_action_constraint_passes_with_no_warnings; 
++test_ilqg_bad_constraint_expression_reports_plain_message; 
++test_ilqg_relative_degree_zero_constraint_surfaces_as_advisory_warning; 
++test_ilqg_two_channel_constraint_reported_as_plugin_contract_issue -- all 
+four mirroring an existing "ilqr"-path test of the same shape, now proven 
+on the "ilqg" dispatch branch too).
+
+**Zero changes** to core/ddp_solver/* (any of it); extensions/constraints/ 
+dynamic_control_bounds.py/relative_degree_reduction.py (and their tests); 
+applications/*; wizard/generic_plant.py/equation_parser.py. This DOES 
+supersede the immediately-preceding STATUS entry's "Zero changes... to 
+extensions/dual_control/* (all of it)" claim -- true when that entry was 
+written, no longer true after this one; backward_pass.py/ilqg_function.py/ 
+main_outer_control_loop.py are the three files touched, all additively 
+(new optional parameters, default `None`/unused unless supplied). 
+Full PYTHON/ suite: 328/328 passing (up from 318 pre-feature), zero 
+regressions.
+
 ## Bugs found during conversion (worth telling supervisor)
 - Latent symmetry bug in original MATLAB's Sxxh computation 
   (backward_pass.m) — caused inconsistent gradient/Newton-step. Never 
