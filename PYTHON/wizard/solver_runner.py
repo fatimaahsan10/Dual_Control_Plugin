@@ -1,20 +1,31 @@
 """
-Runs the wizard's "Run Simulation" step: compile the config
-(generic_plant.py) then call the REAL, UNMODIFIED
-extensions/dual_control/main_outer_control_loop() -- exactly what
-applications/dynamic_pricing/run_pricing_demo.py and
-applications/duopoly_pricing/run_duopoly_demo.py already do by hand.
-Nothing about that function is changed or wrapped in a way that alters
-its behavior; this module only adds the "never crash, never hang
-silently" guarantees the wizard promises around calling it.
+Runs the wizard's "Run Simulation" step. Dispatches on
+`config.control_method` (see schema.py) to one of two solvers, both REAL
+and UNMODIFIED:
+
+  "ilqg" (default) -- compile the config (generic_plant.py) then call
+      extensions/dual_control/main_outer_control_loop() -- exactly what
+      applications/dynamic_pricing/run_pricing_demo.py and
+      applications/duopoly_pricing/run_duopoly_demo.py already do by
+      hand. Unchanged from before this dispatch existed.
+
+  "ilqr" -- compile the config via wizard/core_ilqr_adapter.py (which
+      itself reuses generic_plant.py's compile_plant(), plus, if the
+      config has any enabled constraints, extensions/constraints/'s
+      Dastan & Sensinger machinery) then call
+      core/ddp_solver/ilqg.py's ilqg().
+
+Neither branch changes what its target solver does; this module only
+adds the "never crash, never hang silently" guarantees the wizard
+promises around calling either one.
 
 TIMEOUT DESIGN (documented limitation, not a claimed fix): the config's
 own n_sessions/max_du_iterations are already hard-capped by schema.py
 (MAX_N_SESSIONS/MAX_DU_ITERATIONS) -- THAT bound is the primary defense
 against a runaway run. The wall-clock timeout here is a backstop on top
-of that, implemented by running main_outer_control_loop() in a background
-thread and giving up waiting after `timeout_seconds`. Because the call is
-a long blocking sequence of plain Python/NumPy operations, Python cannot
+of that, implemented by running the actual solve in a background thread
+and giving up waiting after `timeout_seconds`. Because the call is a long
+blocking sequence of plain Python/NumPy operations, Python cannot
 forcibly kill the thread if the timeout fires -- the abandoned computation
 may keep running in the background for a while even after this function
 has already returned a timeout report to the caller. This is the same
@@ -34,6 +45,7 @@ import numpy as np
 
 from extensions.dual_control.main_outer_control_loop import main_outer_control_loop
 
+from wizard.core_ilqr_adapter import ConstraintCompilationError, compile_ilqr, solve_ilqr
 from wizard.generic_plant import compile_plant, PlantCompilationError
 from wizard.schema import ModelConfig
 
@@ -70,7 +82,68 @@ def _translate_solver_exception(e: Exception) -> str:
 
 def run_solver(config: ModelConfig,
                 timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> SolverReport:
-    """Never raises -- always returns a SolverReport."""
+    """Never raises -- always returns a SolverReport. Dispatches on
+    config.control_method; see module docstring."""
+    if config.control_method == "ilqr":
+        return _run_ilqr(config, timeout_seconds)
+    return _run_ilqg(config, timeout_seconds)
+
+
+def _run_ilqr(config: ModelConfig,
+               timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> SolverReport:
+    try:
+        inputs = compile_ilqr(config)
+    except (PlantCompilationError, ConstraintCompilationError) as e:
+        return SolverReport(ok=False, messages=list(e.errors))
+    except Exception as e:  # noqa: BLE001
+        return SolverReport(
+            ok=False,
+            messages=["Something unexpected went wrong while building "
+                       "your model from its equations."],
+            raw_error=f"{type(e).__name__}: {e}")
+
+    start = time.monotonic()
+    executor = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    future = executor.submit(solve_ilqr, inputs)
+    try:
+        result = future.result(timeout=timeout_seconds)
+    except concurrent.futures.TimeoutError:
+        executor.shutdown(wait=False)  # see module docstring: doesn't kill the thread
+        elapsed = time.monotonic() - start
+        return SolverReport(
+            ok=False, elapsed_seconds=elapsed,
+            messages=[f"This run took longer than {timeout_seconds:.0f} "
+                       f"seconds and was stopped. Try lowering the number "
+                       f"of steps to simulate, or the planning-iteration "
+                       f"limits under Advanced settings."])
+    except Exception as e:  # noqa: BLE001
+        executor.shutdown(wait=False)
+        elapsed = time.monotonic() - start
+        return SolverReport(
+            ok=False, elapsed_seconds=elapsed,
+            messages=[_translate_solver_exception(e)],
+            raw_error=f"{type(e).__name__}: {e}")
+    else:
+        executor.shutdown(wait=False)
+
+    elapsed = time.monotonic() - start
+
+    bad_keys = [k for k, v in result.items()
+                 if isinstance(v, np.ndarray) and not np.isfinite(v).all()]
+    if bad_keys:
+        return SolverReport(
+            ok=False, result=result, elapsed_seconds=elapsed,
+            messages=[f"The solver produced invalid numbers (NaN/Inf) in: "
+                       f"{', '.join(bad_keys)}. This usually means an "
+                       f"equation divides by something that reaches zero, "
+                       f"or a bound/constraint setting is too extreme. Try "
+                       f"adjusting the equations, bounds, or constraints."])
+
+    return SolverReport(ok=True, result=result, elapsed_seconds=elapsed)
+
+
+def _run_ilqg(config: ModelConfig,
+               timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS) -> SolverReport:
     try:
         plant = compile_plant(config)
     except PlantCompilationError as e:

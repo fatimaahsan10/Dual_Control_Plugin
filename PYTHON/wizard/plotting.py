@@ -102,6 +102,43 @@ def plot_parameters(result: dict, config: ModelConfig) -> Figure | None:
     return fig
 
 
+def plot_convergence(result: dict) -> Figure | None:
+    """iLQR-only diagnostic (control_method == "ilqr", see schema.py) --
+    core.ddp_solver.ilqg.ilqg()'s own `trace` (one dict per iteration,
+    each carrying at least "cost" and "grad_norm" once a backward pass
+    succeeds -- see ilqg.py's docstring) has no equivalent for the iLQG/
+    dual-control path (there is no single "convergence" to plot for an
+    MPC loop that replans every step), so this is never called from that
+    path."""
+    trace = result.get("trace")
+    if not isinstance(trace, list) or not trace:
+        return None
+
+    iters = [r["iter"] for r in trace if "cost" in r]
+    costs = [r["cost"] for r in trace if "cost" in r]
+    grad_iters = [r["iter"] for r in trace if "grad_norm" in r]
+    grad_norms = [r["grad_norm"] for r in trace if "grad_norm" in r]
+    if not costs and not grad_norms:
+        return None
+
+    fig = Figure(figsize=(7, 4.0))
+    ax1 = fig.add_subplot(2, 1, 1)
+    if costs:
+        ax1.plot(iters, costs, marker="o", markersize=3)
+    ax1.set_ylabel("total cost")
+    ax1.set_xlabel("iteration")
+    ax1.set_title("iLQR convergence")
+
+    ax2 = fig.add_subplot(2, 1, 2)
+    if grad_norms:
+        ax2.plot(grad_iters, grad_norms, marker="o", markersize=3, color="tab:orange")
+        ax2.set_yscale("log")
+    ax2.set_ylabel("gradient norm")
+    ax2.set_xlabel("iteration")
+    fig.tight_layout()
+    return fig
+
+
 def plot_cost(result: dict) -> Figure | None:
     cost_true = result.get("cost_true")
     if not _has_finite_data(cost_true, ndim=1):

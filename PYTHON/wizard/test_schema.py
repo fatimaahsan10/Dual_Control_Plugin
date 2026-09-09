@@ -2,7 +2,7 @@ import pytest
 
 from wizard.schema import (
     ModelConfig, StateSpec, ActionSpec, ParameterSpec, ConstantSpec,
-    MeasurementSpec, CostSpec, SolverSettings, MAX_N_SESSIONS,
+    ConstraintSpec, MeasurementSpec, CostSpec, SolverSettings, MAX_N_SESSIONS,
     MAX_DU_ITERATIONS,
 )
 
@@ -186,3 +186,131 @@ def test_validate_never_raises_on_garbage_config():
     errors = cfg.validate()
     assert isinstance(errors, list)
     assert len(errors) > 0
+
+
+# ----------------------------------------------------------------------
+# control_method / ConstraintSpec (Plan B: generic constraint layer)
+# ----------------------------------------------------------------------
+
+def test_control_method_defaults_to_ilqg_for_backward_compatibility():
+    """Every config saved before this field existed has no "control_method"
+    key at all -- from_dict() must default it to "ilqg" so an old saved
+    model keeps behaving exactly as before."""
+    cfg = _minimal_valid_config()
+    assert cfg.control_method == "ilqg"
+    d = cfg.to_dict()
+    del d["control_method"]
+    restored = ModelConfig.from_dict(d)
+    assert restored.control_method == "ilqg"
+
+
+def test_invalid_control_method_flagged():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "nonsense"
+    errors = cfg.validate()
+    assert any("Control method" in e for e in errors)
+
+
+def test_ilqr_needs_at_least_two_sessions():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.n_sessions = 1
+    errors = cfg.validate()
+    assert any("at least 2 steps" in e for e in errors)
+
+
+def test_constraints_default_empty_and_round_trip():
+    cfg = _minimal_valid_config()
+    assert cfg.constraints == []
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                        expression="1 - u1", enabled=True)]
+    d = cfg.to_dict()
+    restored = ModelConfig.from_dict(d)
+    assert restored == cfg
+    assert restored.constraints[0].kind == "state_action"
+
+
+def test_constraint_missing_name_flagged():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="", kind="state_action", expression="1 - u1")]
+    errors = cfg.validate()
+    assert any("Every constraint needs a name" in e for e in errors)
+
+
+def test_duplicate_constraint_name_flagged():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [
+        ConstraintSpec(name="c1", kind="state_action", expression="1 - u1"),
+        ConstraintSpec(name="c1", kind="state_action", expression="2 - u1"),
+    ]
+    errors = cfg.validate()
+    assert any("used more than once" in e for e in errors)
+
+
+def test_invalid_constraint_kind_flagged():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="bogus", expression="1 - u1")]
+    errors = cfg.validate()
+    assert any("kind must be one of" in e for e in errors)
+
+
+def test_empty_constraint_expression_flagged():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action", expression="  ")]
+    errors = cfg.validate()
+    assert any("expression is empty" in e for e in errors)
+
+
+def test_state_only_constraint_needs_positive_alpha():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_only",
+                                        expression="1 - x1", alpha=0.0)]
+    errors = cfg.validate()
+    assert any("alpha must be a positive number" in e for e in errors)
+
+
+def test_state_action_constraint_alpha_not_checked():
+    """alpha is unused for kind=="state_action" -- an invalid value there
+    must not be flagged (only state_only's Lie-derivative reduction uses
+    it)."""
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                        expression="1 - u1", alpha=0.0)]
+    errors = cfg.validate()
+    assert not any("alpha" in e for e in errors)
+
+
+def test_enabled_constraint_requires_ilqr_control_method():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqg"  # default -- no constraint_fn hook there
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                        expression="1 - u1", enabled=True)]
+    errors = cfg.validate()
+    assert any("only enforced in iLQR" in e for e in errors)
+
+
+def test_disabled_constraint_does_not_require_ilqr():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqg"
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                        expression="1 - u1", enabled=False)]
+    errors = cfg.validate()
+    assert not any("only enforced in iLQR" in e for e in errors)
+
+
+def test_enabled_constraint_requires_box_qp_bound_method():
+    cfg = _minimal_valid_config()
+    cfg.control_method = "ilqr"
+    cfg.n_sessions = 5
+    cfg.solver.u_lim_method = 2  # tanh-squash
+    cfg.constraints = [ConstraintSpec(name="c1", kind="state_action",
+                                        expression="1 - u1", enabled=True)]
+    errors = cfg.validate()
+    assert any("Box-QP" in e for e in errors)
