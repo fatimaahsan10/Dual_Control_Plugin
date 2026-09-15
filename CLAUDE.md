@@ -1611,6 +1611,36 @@ main_outer_control_loop.py are the three files touched, all additively
 Full PYTHON/ suite: 328/328 passing (up from 318 pre-feature), zero 
 regressions.
 
+**DOCUMENTATION FOLLOW-UP (2026-09-10):** the STATUS entry above updated 
+the code but left the two human-facing docs describing this layer's 
+plug-in surface stale -- caught and fixed when explicitly asked whether 
+"plugin guidelines protocol files" also needed updating: 
+- extensions/dual_control/protocols.py had no Protocol class at all for 
+  the new `constraint_fn` hook (core/ddp_solver/protocols.py already had 
+  one, from the earlier Zahid-only work, so only the dual_control side 
+  was missing it). Added a `ConstraintFn` Protocol class (module 
+  docstring's "plug-in surface" paragraph updated to mention it as an 
+  optional fifth callable), documenting the `xa_bar[:nx, :N]` 
+  physical-states-only convention, the `(N, nu, 2)` return shape, the 
+  `u_lim_method == 1`-only restriction, and the `flg_change`-gated 
+  once-per-solve-iteration recompute -- transcribed from 
+  ilqg_function.py's own docstring (lines ~65-93 as of this writing), 
+  not guessed.
+- PYTHON/PLUGIN_GUIDE.md (the narrative walkthrough) had zero mentions 
+  of this hook anywhere -- §3.2 (dual-control contract) added a new 
+  `constraint_fn(x_traj, u_traj) -> lims` subsection mirroring §3.3's 
+  existing one for the core layer; §4 Step 7's `main_outer_control_loop` 
+  optional-parameters table got a new `constraint_fn` row; §6 
+  (validator section) flags a real gap found while writing this update -- 
+  `extensions/dual_control/validate_plugin.py`'s `validate_dual_control_plugin` 
+  does NOT itself check `constraint_fn` (confirmed by grep, zero matches) 
+  even though the core layer's `validate_constraint_fn` is plant/layer- 
+  agnostic and can be called directly against a dual-control plant's 
+  `constraint_fn` too -- documented as a separate manual step (exactly 
+  what wizard/validation_runner.py's `_validate_ilqg` already does 
+  internally), not silently presented as covered; §8 checklist got a 
+  matching bullet. No code changes in this follow-up, docs only.
+
 ## Bugs found during conversion (worth telling supervisor)
 - Latent symmetry bug in original MATLAB's Sxxh computation 
   (backward_pass.m) — caused inconsistent gradient/Newton-step. Never 

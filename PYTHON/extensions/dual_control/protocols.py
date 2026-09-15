@@ -17,13 +17,14 @@ file.
 
 WHAT COUNTS AS THE PLUG-IN SURFACE: a new plant author must supply
 DynamicsFn, MeasurementFn, CostFn, and ContinuousDynamicsFn (the four
-Protocols below). `simulate_system` (extensions/dual_control/
-simulate_system.py) is NOT part of this surface -- it is solver-provided
-infrastructure, always reused as-is per the project's existing "reuse as
-is" convention (see CLAUDE.md's Katie conversion plan), parameterized
-BY the four plant callables rather than being one itself. It is
-documented at the bottom of this file for reference only, not as a
-Protocol a plant author implements.
+Protocols below), plus an OPTIONAL fifth, ConstraintFn, if the plant has
+state-dependent control constraints. `simulate_system` (extensions/
+dual_control/simulate_system.py) is NOT part of this surface -- it is
+solver-provided infrastructure, always reused as-is per the project's
+existing "reuse as is" convention (see CLAUDE.md's Katie conversion
+plan), parameterized BY the four plant callables rather than being one
+itself. It is documented at the bottom of this file for reference only,
+not as a Protocol a plant author implements.
 
 SHARED CONVENTIONS across all four Protocols (stated once here rather
 than repeated on each):
@@ -313,6 +314,68 @@ class ContinuousDynamicsFn(Protocol):
         u_lims: Optional[np.ndarray],
         u_lim_method: int,
     ) -> tuple[np.ndarray, int, int, np.ndarray, np.ndarray]: ...
+
+
+class ConstraintFn(Protocol):
+    """
+    OPTIONAL fifth plug-in surface. Contract for `constraint_fn`, as
+    consumed by ilqg_function.py and forwarded unchanged (pure pass-
+    through) by main_outer_control_loop.py -- the Dastan & Sensinger
+    (2024) state-dependent-constraint extension (see extensions/
+    constraints/dynamic_control_bounds.py's build_time_varying_lims and
+    extensions/constraints/relative_degree_reduction.py's
+    state_constraint_to_control_constraint, the two supplied ways to
+    build one of these), added to this layer to match the same hook
+    core/ddp_solver/ilqg.py already had (see that module's
+    ConstraintFn Protocol above this one's model). If omitted (the
+    default, `constraint_fn=None`), this layer's behavior is unchanged
+    from before this hook existed.
+
+    __call__(x_traj, u_traj) -> lims
+
+    Parameters
+    ----------
+    x_traj : (nx, N) ndarray
+        The CURRENT nominal trajectory's PHYSICAL states only --
+        `xa_bar[:nx, :N]` -- even when `augment_states` is True. The
+        augmented (estimated-parameter) rows are deliberately excluded:
+        a constraint written against a plant's own named states has no
+        notion of the estimator's internal augmented dimensions.
+    u_traj : (nu, N) ndarray
+        The current nominal control sequence for this solve iteration
+        (`u_bar`), one column per control step.
+
+    Returns
+    -------
+    lims : (N, nu, 2) ndarray
+        Per-control-step box, `lims[i]` = (lower, upper) applying at
+        control step i -- same per-timestep shape backward_pass.py's
+        `lims` parameter now accepts alongside its original fixed
+        `(nu, 2)` shape. No "unconstrained" sentinel is recognized for
+        this shape; pass `constraint_fn=None` to disable constraints
+        instead of trying to encode "unconstrained" through the return
+        value.
+
+    Recomputed once per SOLVE iteration, right after the forward pass
+    re-differentiates (i.e. whenever `flg_change` is True inside
+    ilqg_function.py, mirroring core ilqg.py's own `flg_change`-gated
+    recompute) -- not once per line-search candidate. Only meaningful
+    when `u_lim_method == 1` (Box-QP); a tanh-squashed control
+    (`u_lim_method == 2`) has no box for this to replace, so
+    `constraint_fn` is silently ignored in that case (same restriction
+    wizard/schema.py's ModelConfig.validate() enforces for its own
+    "ilqr" control method). The initial nominal-rollout call and the
+    line-search loop inside ilqg_function.py always use the fixed
+    `u_lims`, never `constraint_fn` -- consistent with this function's
+    pre-existing behavior for the plain `(nu, 2)` box case: the line
+    search here has never explicitly clipped `u` against `u_lims`
+    either, relying entirely on backward_pass()'s box-QP having already
+    produced feasible gains.
+    """
+
+    def __call__(
+        self, x_traj: np.ndarray, u_traj: np.ndarray
+    ) -> np.ndarray: ...
 
 
 class SimulateSystemFn(Protocol):

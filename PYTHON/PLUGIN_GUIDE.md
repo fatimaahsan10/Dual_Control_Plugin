@@ -18,6 +18,7 @@ hit `ModuleNotFoundError` on the very first import), [§3](#3-the-exact-contract
 
 0. [One-time setup](#0-one-time-setup)
 1. [What this framework does](#1-what-this-framework-does)
+   - [1.1 Which setup do I need?](#11-which-setup-do-i-need)
 2. [What "plugging in a model" means](#2-what-plugging-in-a-model-means)
 3. [The exact contract: what your plant must implement](#3-the-exact-contract-what-your-plant-must-implement)
 4. [Worked example: building `applications/dynamic_pricing/`](#4-worked-example-building-applicationsdynamic_pricing)
@@ -156,6 +157,65 @@ Python callables and never assume anything about what system you're
 modeling. Plugging in a new model means writing those callables, not
 modifying the solver.
 
+### 1.1 Which setup do I need?
+
+There are now **two independent choices**, not one — pick a layer, then
+separately decide whether you also need a constraint. (This is the
+hand-written/VS-Code path; the Streamlit wizard, `wizard/WIZARD_GUIDE.md`,
+asks you the same two questions through its UI instead of file-writing.)
+
+**Choice 1 — which solver layer (pick exactly one):**
+
+| You need... | Layer | Required callables | Entry point |
+|---|---|---|---|
+| Online parameter estimation, noise, dual control ("curiosity") | `extensions/dual_control/` | 4: `continuous_dynamics`, `dynamics`, `measurement`, `cost` (§3.2) | `main_outer_control_loop()` |
+| Just the best deterministic open-loop trajectory, no unknowns | `core/ddp_solver/` | 2: `step_fn`, `derivs_fn` (§3.3) | `ilqg()` |
+
+If you're not sure: §1's paragraphs above spell out the tradeoff in more
+depth, and `wizard/schema.py`'s `control_method` field (`"ilqg"` vs.
+`"ilqr"`) is the same choice under different names — see
+`wizard/WIZARD_GUIDE.md` if you'd rather answer this question through
+the guided UI than by writing files directly.
+
+**Choice 2 — do you also need a state-dependent constraint? (optional,
+independent of Choice 1):**
+
+Only if a control bound needs to *shrink or shift depending on the
+current state* — a fixed `(nu, 2)` box (`u_lims`) can't express that. If
+yes, write a **5th (core layer) / optional 5th (dual-control layer)**
+callable, `constraint_fn`, composed from `extensions/constraints/` — see
+§3.2's/§3.3's `constraint_fn` subsections for the exact recipe (which
+one of `dynamic_control_bounds.py`/`relative_degree_reduction.py` you
+need depends on whether your constraint `h` is a function of `(x, u)`
+directly or of `x` alone). This composes with **either** layer from
+Choice 1 — added to the core layer first (2026-09-09), then to the
+dual-control layer as a follow-on (2026-09-09) so parameter *learning*
+and a state-dependent *constraint* can now run on the same model (see
+`CLAUDE.md`'s "STATUS — Wizard: constraint_fn hook added to the
+iLQG/dual-control path" for the concrete robot-arm example that
+motivated it).
+
+**So, four combinations exist now**, all reachable by hand-writing
+files (this guide) or through the wizard:
+
+1. Dual control, no constraint — the original §4 worked example.
+2. Dual control + constraint — write the same 4 files, plus
+   `constraint_fn`; see the wizard's shipped
+   `wizard/models/2_Link_Robotic_Arm.json` for a worked instance (learns
+   an unknown link mass *and* enforces a speed-derated torque cap).
+3. Core/`ilqr`, no constraint — §5's worked example.
+4. Core/`ilqr` + constraint — write `step_fn`/`derivs_fn`, plus
+   `constraint_fn`; see `applications/pendulum_constrained/run_zahid_demo.py`
+   (hand-wired) or the wizard's shipped
+   `wizard/examples/robot_arm_ilqr_constrained.json` (generic compiler
+   via `wizard/core_ilqr_adapter.py`) for worked instances.
+
+The step-by-step for each of the four is identical in shape: write the
+callables for your chosen layer (§3.2 or §3.3) → optionally add
+`constraint_fn` (same section) → validate everything (§6) → run it for
+real and sanity-check the actual behavior, not just that validation
+passed (§4 Step 7 / §5 Step 5).
+
 ## 2. What "plugging in a model" means
 
 Concretely, plugging in a model means writing a small number of
@@ -235,9 +295,11 @@ These apply to every function in both layers below:
 
 ### 3.2 The dual-control layer (`extensions/dual_control/protocols.py`)
 
-You implement **four callables**. Each is a `typing.Protocol` class in
-that file; what follows is a condensed version — read the file itself
-for the full reasoning behind each convention.
+You implement **four callables**, plus an **optional fifth**
+(`constraint_fn`, if your plant has state-dependent control
+constraints — see the end of this section). Each is a `typing.Protocol`
+class in that file; what follows is a condensed version — read the file
+itself for the full reasoning behind each convention.
 
 #### `dynamics(dt, xa, u, constants, w, noise_index, augment_states, w_from_filter, dyn_noise_reg_lambda, u_lims, u_lim_method) -> (nxa, K) ndarray`
 
@@ -334,6 +396,50 @@ A common (not required) pattern: implement `continuous_dynamics` first,
 then have `dynamics` call it and Euler-integrate the result
 (`xa + dt*xdot + noise`) — this is what the worked example in §4 does.
 
+#### `constraint_fn(x_traj, u_traj) -> lims` (optional)
+
+Only needed if your problem has **state-dependent** control constraints
+— e.g. a torque cap that shrinks as a joint speeds up, rather than a
+fixed box. This is the Dastan & Sensinger (2024) constrained-DDP
+extension (`extensions/constraints/`), and as of this hook being added
+to `ilqg_function.py`/`main_outer_control_loop.py` it's available in
+**both** layers, not just the core layer's `constraint_fn` (§3.3) — a
+plant here can now combine online parameter *estimation* with a
+state-dependent *constraint* on the same model (see
+`extensions/dual_control/protocols.py`'s `ConstraintFn` for the full
+docstring).
+
+| Argument | Shape / type | Meaning |
+|---|---|---|
+| `x_traj` | `(nx, N)` | current nominal trajectory's **physical** states only — `xa_bar[:nx, :N]`, excluding the augmented-parameter rows even if `augment_states` is `True` |
+| `u_traj` | `(nu, N)` | current nominal control sequence, one column per control step |
+
+Return `lims`, shape `(N, nu, 2)` — a per-control-step box,
+`lims[i] = (lower, upper)` at control step `i`. This is the same
+per-timestep shape `backward_pass.py`'s `lims` parameter now accepts
+alongside its original fixed `(nu, 2)` shape.
+
+Two restrictions worth knowing up front:
+- Only takes effect when `u_lim_method == 1` (box-QP) — a
+  `u_lim_method == 2` tanh-squashed control has no box for this to
+  replace, so `constraint_fn` is silently ignored in that case (same
+  restriction the wizard's schema enforces for its own "ilqr" control
+  method).
+- Recomputed once per solve iteration (gated the same way the dynamics
+  Jacobians are re-differentiated), **not** once per line-search
+  candidate — and the initial nominal rollout / line-search loop always
+  use the fixed `u_lims`, never `constraint_fn`.
+
+Build one with `extensions/constraints/dynamic_control_bounds.py`'s
+`build_time_varying_lims` (direct `h(x,u)>=0` constraints) or
+`extensions/constraints/relative_degree_reduction.py`'s
+`state_constraint_to_control_constraint` composed with it (pure
+state constraints `h(x)>=0`, reduced via one Lie derivative) — see
+`applications/pendulum_constrained/run_zahid_demo.py` for a worked
+example against the core layer, and `wizard/core_ilqr_adapter.py`'s
+`build_constraint_fn` for a generic compiler from a parsed equation to
+one of these callables.
+
 ### 3.3 The plain deterministic layer (`core/ddp_solver/protocols.py`)
 
 Use this instead if you don't need noise or online parameter
@@ -367,6 +473,10 @@ The solver entry point for this layer is `core.ddp_solver.ilqg.ilqg`;
 see §5 for a complete, runnable call.
 
 ## 4. Worked example: building `applications/dynamic_pricing/`
+
+*(This is the `extensions/dual_control/` layer from §1.1 — the wizard's
+`control_method="ilqg"` / "iLQG / Dual Control" option. If you decided
+in §1.1 you want the other layer instead, skip to §5.)*
 
 This walks through how `applications/dynamic_pricing/` was actually
 built, end to end, as a template for your own plant. The problem: a
@@ -701,6 +811,7 @@ its docstring:
 | `nw` | `None` | Dynamics noise-channel count fed to `dynamics`'s `w` argument (§3.2). Left `None`, it's computed automatically as `nx+n_p` (if `augment_states_in_ilqg`) or `nx`. |
 | `u_bar_0` | `None` | Optional `(nu, N)` initial control guess for the **first** iLQG call only — every later call warm-starts from the previous solution's shifted trajectory regardless of this. Not in the original MATLAB source; added to let you nudge a non-convex cost landscape's first solve away from an all-zero local optimum that a bilinear (cross-term) cost surface can otherwise settle into. Left `None`, the first call warm-starts from all-zeros, same as before this parameter existed. |
 | `verbose` | `False` | Print per-session progress. |
+| `constraint_fn` | `None` | Optional state-dependent control constraint (§3.2's `constraint_fn(x_traj, u_traj) -> lims`, Dastan & Sensinger 2024) — forwarded unchanged to every session's inner `ilqg_function()` call. Pure pass-through; `main_outer_control_loop` never calls it itself. Left `None`, behavior is unchanged from before this hook existed. |
 
 None of these need to change from their defaults to get the dynamic-pricing
 demo working — they're listed here so you know what to reach for if your
@@ -806,7 +917,94 @@ bug's own diagnosis in `run_pricing_demo.py`'s module docstring and
   `u_lim_method=2`'s tanh reparameterization before suspecting the cost
   function itself — try `u_lim_method=1` first.
 
+#### Step 8 (optional) — Add a state-dependent constraint_fn
+
+Everything through Step 7 is exactly how `applications/dynamic_pricing/`
+was actually built — it ships with **no** constraint. This step extends
+that same example past what the real folder contains, purely to show the
+mechanics of §3.2's optional `constraint_fn` concretely, on a plant
+you've already built. (Two other real, in-repo, test-verified instances
+of this same hook on this same layer: `extensions/dual_control/
+test_ilqg_function.py::test_constraint_fn_recomputes_a_tighter_box_each_iteration`
+and `extensions/dual_control/test_main_outer_control_loop.py::
+test_constraint_fn_threads_through_to_every_session`.)
+
+Say you want price capped relative to *current* demand — e.g. price
+should never be set more than $20 above whatever demand currently is —
+instead of a flat ceiling. A fixed `u_lims` box can't express that; it's
+exactly what `constraint_fn` is for. The constraint is
+`h(x, u) = (x1 + 20) - price >= 0`, i.e. `price <= x1 + 20`. Since `h`
+already depends on `u` directly (not just `x`), this is the
+**`state_action`** case (§1.1) — no Lie-derivative reduction needed, go
+straight to `extensions/constraints/dynamic_control_bounds.py`'s
+`build_time_varying_lims` (Variant A):
+
+```python
+import numpy as np
+from extensions.constraints.dynamic_control_bounds import build_time_varying_lims
+
+def price_cap_h(x, u):
+    return (x[0] + 20.0) - u[0]
+
+def dh_price_cap_du(x, u):
+    # analytic Jacobian, optional (falls back to finite differences via
+    # extensions/dual_control/finite_difference.py if omitted) -- cheap
+    # to supply here since h is affine in u
+    return np.array([[-1.0]])
+
+def constraint_fn(x_traj, u_traj):
+    return build_time_varying_lims(
+        price_cap_h, x_traj, u_traj, dhdu_fn=dh_price_cap_du)
+```
+
+`constraint_fn` matches `extensions/dual_control/protocols.py`'s
+`ConstraintFn` exactly: `x_traj` is `(nx, N)` **physical** states only
+(the augmented `b_hat` row is excluded even though this plant augments),
+`u_traj` is `(nu, N)`, and the return is `(N, nu, 2)`. Pass it straight
+into Step 7's `main_outer_control_loop` call:
+
+```python
+result = main_outer_control_loop(
+    T=15.0, dt=1.0,
+    x_hat_0=x0, x_true_0=x0.copy(),
+    p_hat_0=np.array([0.5]), p_true=np.array([2.0]),
+    cov_X=1.0, cov_P=np.array([[1.0]]),
+    constants=constants, u_lims=np.array([[10.0, 45.0]]), u_lim_method=1,
+    dynamics=dynamics, measurement=measurement, cost=cost,
+    continuous_dynamics=continuous_dynamics, ny=1, nv=1,
+    reg_type=1, max_du_iterations=60, first_run_max_du_iterations=100,
+    augment_states_in_ilqg=True, augment_states_in_filter=True,
+    constraint_fn=constraint_fn)               # <-- the only new line
+```
+
+`u_lim_method` **must stay `1`** (§3.2's `constraint_fn` subsection) —
+this demo already uses `1`, but if you're adapting a `u_lim_method=2`
+plant, switch it first or the constraint is silently ignored.
+
+Validate the constraint on its own before trusting it — recall from §6
+that `validate_dual_control_plugin` does **not** check `constraint_fn`
+for you:
+
+```python
+from core.ddp_solver.validate_plugin import validate_constraint_fn, PluginContractError
+
+issues = validate_constraint_fn(constraint_fn, n=1, m=1, N=14)  # N = n_sessions - 1
+if issues:
+    raise PluginContractError(issues)
+```
+
+If your own constraint is a **pure state** constraint instead (`h(x)`,
+no `u` in it at all — e.g. "demand must stay under some ceiling"
+regardless of price), you can't hand it to `build_time_varying_lims`
+directly — see §5 Step 6 for the complete worked reduction
+(`extensions/constraints/relative_degree_reduction.py`), which composes
+the same way regardless of which layer you're using.
+
 ## 5. Worked example: the plain core layer (`applications/todorov_toy/`)
+
+*(This is the `core/ddp_solver/` layer from §1.1 — the wizard's
+`control_method="ilqr"` / "iLQR" option. If you decided in §1.1 you want
+the other layer instead, go back to §4.)*
 
 This is the equally-complete counterpart to §4 for the layer without
 noise or online parameter estimation — `core/ddp_solver/`. Use this
@@ -959,13 +1157,122 @@ failure, recheck `derivs_fn` before suspecting the solver
 derived LQR solution, so a divergence on your own plant almost always
 traces back to your derivatives, not the solver).
 
+#### Step 6 (optional) — Add a state-dependent constraint_fn
+
+Unlike §4 Step 8 (illustrative, grafted onto a demo that doesn't
+actually have one), this one **is** a real, complete, already-in-repo
+example: `applications/pendulum_constrained/run_zahid_demo.py`. It's the
+worked reproduction of Dastan & Sensinger (2024)'s own inverted-pendulum
+experiment — an inverted pendulum (`x = [phi, omega]`, one torque-like
+action `u`) that must keep angular velocity under a limit,
+`omega < 1`, i.e. `h(x) = 1 - omega >= 0`. This `h` depends only on
+`x` — **no** `u` in it — so unlike §4 Step 8's direct case, it's the
+**`state_only`** case (§1.1): `h` must first be reduced to a
+control-dependent constraint via one Lie derivative
+(`extensions/constraints/relative_degree_reduction.py`, eq 16-19 of the
+paper) before `dynamic_control_bounds.py`'s `build_time_varying_lims`
+can turn it into a box:
+
+```python
+import numpy as np
+from extensions.constraints.dynamic_control_bounds import build_time_varying_lims
+from extensions.constraints.relative_degree_reduction import state_constraint_to_control_constraint
+
+def h_omega(x):
+    return np.array([1.0 - x[1]])          # h(x) = 1 - omega >= 0
+
+def dh_omega_dx(x):
+    return np.array([[0.0, -1.0]])          # analytic dh/dx, optional
+
+def pendulum_continuous_dynamics(x, u):
+    # dx/dt = f(x, u) -- CONTINUOUS-time, required by the Lie-derivative
+    # step (eq 16); NOT the same callable as step_fn (that's discrete)
+    return np.array([x[1], np.sin(x[0]) + u[0]])
+
+ALPHA = 1.0   # eq 18-19's decay rate -- no closed-form selection rule in
+              # the paper; this value is what converges cleanly here
+              # (see the real file's module docstring for the alpha=0.1
+              # "traps the optimizer" finding, reported rather than hidden)
+
+def make_constraint_fn(alpha):
+    h_tilde_fn = state_constraint_to_control_constraint(
+        h_omega, pendulum_continuous_dynamics, alpha, dhdx_fn=dh_omega_dx)
+
+    def constraint_fn(x_traj, u_traj):
+        return build_time_varying_lims(h_tilde_fn, x_traj, u_traj)
+
+    return constraint_fn
+```
+
+(The real file also supplies an analytic `dhdu_fn` to
+`build_time_varying_lims` — omitted here since `h_tilde` is affine in
+`u` and the finite-difference fallback is exact to float roundoff in
+that case; see the file itself if you want that last bit of precision.)
+
+Pass it straight into `ilqg()` alongside `step_fn`/`derivs_fn` — this
+matches §5 Step 4's call, with one added keyword:
+
+```python
+constraint_fn = make_constraint_fn(ALPHA)
+x, u, L, Vx, Vxx, cost, trace, stop_reason = ilqg(
+    step_fn, derivs_fn, x0, u0, lims=None,
+    constraint_fn=constraint_fn,             # <-- the only new argument
+    max_iter=50, tol_fun=1e-12, tol_grad=1e-10, verbose=1)
+```
+
+Validate it the same way as §4 Step 8, but through the core layer's
+entry point (which — unlike the dual-control layer's — the built-in
+`validate_core_plugin` already covers automatically if you pass
+`constraint_fn` to it directly, per §6):
+
+```python
+from core.ddp_solver.validate_plugin import validate_core_plugin
+
+validate_core_plugin(step_fn, derivs_fn, n=2, m=1, N=N,
+                      constraint_fn=constraint_fn)
+```
+
+Run `applications/pendulum_constrained/run_zahid_demo.py` directly
+(`python run_zahid_demo.py`) to see this exact composition end to end,
+including the real, honestly-reported finding that the paper's own
+stated `alpha=0.1` traps this optimizer for a diagnosed, non-bug reason
+— worth reading before picking your own `alpha` if you build a
+`state_only` constraint of your own.
+
+If your own constraint already depends on `u` directly instead (the
+`state_action` case), skip the Lie-derivative step entirely and call
+`build_time_varying_lims` directly on your own `h(x, u)` — see §4 Step
+8's price-cap example for that simpler case, which composes the same
+way regardless of which layer you're using.
+
 ## 6. Validate before you run: `validate_plugin.py`
 
 Both layers ship a validator: `core/ddp_solver/validate_plugin.py`
 (`validate_core_plugin`) for `step_fn`/`derivs_fn`[/`constraint_fn`],
 and `extensions/dual_control/validate_plugin.py`
 (`validate_dual_control_plugin`) for
-`dynamics`/`measurement`/`cost`/`continuous_dynamics`. Both are
+`dynamics`/`measurement`/`cost`/`continuous_dynamics`.
+**`validate_dual_control_plugin` does not itself check `constraint_fn`**
+(§3.2) — if you're using that optional fifth callable, validate it
+separately with the same `validate_constraint_fn` function the core
+layer uses (it's plant/layer-agnostic — only needs `n`/`m`/`N`, not a
+`constants` object):
+
+```python
+from core.ddp_solver.validate_plugin import validate_constraint_fn, PluginContractError
+
+issues = validate_constraint_fn(constraint_fn, n=nx, m=nu, N=your_horizon_N)
+if issues:
+    raise PluginContractError(issues)
+```
+
+(This is exactly what `wizard/validation_runner.py`'s `_validate_ilqg`
+does internally when a wizard-built model has a constraint enabled —
+see its module for the fuller pattern, including capturing/
+de-duplicating the "relative degree isn't one here" `RuntimeWarning`
+`dynamic_control_bounds.py` can raise.)
+
+Both are
 **entirely opt-in** — nothing in the solver calls them automatically,
 and adding them doesn't modify `ilqg.py`/`forward_pass.py`/
 `back_pass.py`/`main_outer_control_loop.py` in any way. You call one of
@@ -1161,7 +1468,7 @@ found while building the two worked examples in this guide.
       import below fails with `ModuleNotFoundError`.
 - [ ] Picked the right layer: `core/ddp_solver/` if you don't need
       noise/online estimation, `extensions/dual_control/` if you do
-      (§1).
+      (§1, §1.1).
 - [ ] Read the relevant `protocols.py` for your chosen layer before
       writing any function (§2).
 - [ ] Created `applications/<my_plant>/__init__.py` (§0).
@@ -1186,6 +1493,16 @@ found while building the two worked examples in this guide.
       `.squeeze()`-style size-1 assumptions (§3.1, §7.6).
 - [ ] Ran `validate_core_plugin`/`validate_dual_control_plugin` and
       resolved every reported `PluginContractError` issue (§6).
+- [ ] If using the optional `constraint_fn` (state-dependent control
+      constraints, either layer — §1.1): built it from
+      `extensions/constraints/` (`dynamic_control_bounds.py` directly if
+      `h` depends on `u`, or composed with
+      `relative_degree_reduction.py` first if `h` depends on `x` only —
+      complete worked examples of both in §4 Step 8 / §5 Step 6),
+      validated it separately with
+      `core.ddp_solver.validate_plugin.validate_constraint_fn` (§3.2,
+      §3.3, §6 — `validate_dual_control_plugin` does not check it for
+      you), and confirmed it's only relied on under `u_lim_method == 1`.
 - [ ] Ran the plant end-to-end through `ilqg()`/
       `main_outer_control_loop()` and sanity-checked the **actual
       behavior** (parameter estimate converges toward truth; chosen
