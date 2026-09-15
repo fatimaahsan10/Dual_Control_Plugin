@@ -56,20 +56,40 @@ def plot_states(result: dict, config: ModelConfig) -> Figure | None:
     return fig
 
 
-def plot_actions(result: dict, config: ModelConfig) -> Figure | None:
+def plot_actions(result: dict, config: ModelConfig,
+                  lims: np.ndarray | None = None) -> Figure | None:
+    """`lims`, if given, is a (N, nu, 2) per-step bound array (see
+    constraint_diagnostics.BindingReport.lims) overlaid as a dashed line
+    alongside the action's plain, flat min/max bound (dotted) -- lets a
+    constrained model's chart show the ACTUAL bound in force at each step,
+    not just the unconditional action bound, so a viewer can see directly
+    whether the chosen value tracks a tightening constraint rather than
+    only the flat box. Omitted/malformed `lims` leaves the plot exactly as
+    it was before this parameter existed."""
     u = result.get("u")
     if not _has_finite_data(u, ndim=2):
         return None
 
     nu = u.shape[0]
-    steps = np.arange(u.shape[1])
+    N = u.shape[1]
+    steps = np.arange(N)
+
+    show_lims = (isinstance(lims, np.ndarray) and lims.ndim == 3
+                 and lims.shape[0] == N and lims.shape[1] == nu
+                 and np.isfinite(lims).all())
 
     fig = Figure(figsize=(7, 2.0 * nu))
     for j, action in enumerate(config.actions):
         ax = fig.add_subplot(nu, 1, j + 1)
-        ax.step(steps, u[j, :], where="post")
+        ax.step(steps, u[j, :], where="post", label="chosen")
         ax.axhline(action.min, color="gray", linestyle=":", linewidth=1)
         ax.axhline(action.max, color="gray", linestyle=":", linewidth=1)
+        if show_lims:
+            ax.step(steps, lims[:, j, 0], where="post", color="tab:red",
+                     linestyle="--", linewidth=1, label="constraint bound")
+            ax.step(steps, lims[:, j, 1], where="post", color="tab:red",
+                     linestyle="--", linewidth=1)
+            ax.legend(loc="best", fontsize="small")
         ax.set_ylabel(action.label or action.name)
         ax.set_xlabel("step")
     fig.tight_layout()

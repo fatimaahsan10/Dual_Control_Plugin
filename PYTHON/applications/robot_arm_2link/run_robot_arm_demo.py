@@ -39,6 +39,7 @@ Run directly: python run_robot_arm_demo.py
 
 import numpy as np
 
+from extensions.constraints.dynamic_control_bounds import build_time_varying_lims
 from extensions.dual_control.main_outer_control_loop import main_outer_control_loop
 
 from applications.robot_arm_2link.arm_constants import RobotArmConstants
@@ -58,8 +59,47 @@ M2_PRIOR = 0.3   # kg -- badly understates link 2's mass/inertia contribution
 
 Q1_TARGET, Q2_TARGET = np.pi / 3, -np.pi / 4  # 60 deg, -45 deg
 
+# Speed-derated torque cap on joint 1: tau1 <= TAU1_DERATE_CAP -
+# TAU1_DERATE_K*w1^2, tighter than the plain +-30 N*m action bound
+# whenever the joint is already moving (a motor-derating-style safety
+# constraint). Same math and same tuned constants already shipped and
+# proven in wizard/examples/robot_arm_ilqr_constrained.json (see
+# CLAUDE.md's "Wizard: iLQR control method + generic constraints" STATUS
+# entry) -- reused here rather than re-tuned, so this demo and that
+# example are directly comparable. Wired through
+# extensions/dual_control/ilqg_function.py's constraint_fn hook (see
+# CLAUDE.md's "Wizard: constraint_fn hook added to the iLQG/dual-control
+# path" STATUS entry) via extensions/constraints/dynamic_control_bounds.py
+# (Dastan & Sensinger 2024, Variant A) directly -- no wizard involved,
+# this is the raw application-level plug-in.
+TAU1_DERATE_CAP = 28.0   # N*m
+TAU1_DERATE_K = 0.5      # N*m per (rad/s)^2
 
-def run_demo(n_sessions=N_SESSIONS, seed=0, verbose=False):
+
+def _tau1_derate_h(x, u):
+    """h(x, u) = TAU1_DERATE_CAP - TAU1_DERATE_K*w1^2 - tau1 >= 0."""
+    w1 = x[2]
+    return np.array([TAU1_DERATE_CAP - TAU1_DERATE_K * w1 ** 2 - u[0]])
+
+
+def _tau1_derate_dhdu(x, u):
+    """Analytic dh/du -- constant, exact, no finite-difference fallback
+    needed (only tau1's channel is nonzero: dh/dtau1 = -1, dh/dtau2 = 0)."""
+    return np.array([[-1.0, 0.0]])
+
+
+def _build_constraint_fn(u_lims):
+    lower, upper = u_lims[:, 0], u_lims[:, 1]
+
+    def constraint_fn(x_traj, u_traj):
+        return build_time_varying_lims(
+            _tau1_derate_h, x_traj, u_traj, dhdu_fn=_tau1_derate_dhdu,
+            lower=lower, upper=upper)
+
+    return constraint_fn
+
+
+def run_demo(n_sessions=N_SESSIONS, seed=0, verbose=False, use_constraint=True):
     rng = np.random.default_rng(seed)  # noqa: F841 (kept for future noise-seeding hooks)
 
     constants = RobotArmConstants(
@@ -74,6 +114,7 @@ def run_demo(n_sessions=N_SESSIONS, seed=0, verbose=False):
                                       # wide relative to |M2_TRUE-M2_PRIOR|=0.7
 
     u_lims = np.array([[-TAU1_LIM, TAU1_LIM], [-TAU2_LIM, TAU2_LIM]])
+    constraint_fn = _build_constraint_fn(u_lims) if use_constraint else None
 
     result = main_outer_control_loop(
         T=n_sessions * DT, dt=DT, x_hat_0=x0, x_true_0=x0.copy(),
@@ -83,9 +124,87 @@ def run_demo(n_sessions=N_SESSIONS, seed=0, verbose=False):
         continuous_dynamics=continuous_dynamics, ny=4, nv=4,
         reg_type=1, max_du_iterations=100, first_run_max_du_iterations=150,
         augment_states_in_ilqg=True, augment_states_in_filter=True,
-        verbose=verbose)
+        verbose=verbose, constraint_fn=constraint_fn)
 
     return result, constants
+
+
+def binding_report(result, u_lims, touch_tol=0.05):
+    """Quantifies whether the tau1 derating constraint actually bound the
+    controller's choices on this run, rather than being satisfied only
+    because tau1 happened to stay well under it anyway.
+
+    A trajectory that stays far below a constraint's bound the whole time
+    hasn't exercised the constraint mechanism at all -- the identical
+    trajectory would come out if the constraint were removed. Only a
+    trajectory that repeatedly gets pushed up against its own bound is
+    real evidence the constraint is shaping the controller's choices.
+
+    Two independent numbers, reported per step over the whole horizon:
+      - `tightened`: was TAU1_DERATE_CAP - TAU1_DERATE_K*w1^2 actually
+        BELOW the flat +-TAU1_LIM action bound at this step (i.e. did the
+        constraint have anything to do here at all)?
+      - `slack = allowance - tau1`: how close the chosen torque came to
+        that (possibly tightened) bound. Small/near-zero slack = binding.
+    """
+    x_true, u = result["x_true"], result["u"]
+    N = u.shape[1]
+    w1 = x_true[2, :N]
+    tau1 = u[0, :]
+    allowance = TAU1_DERATE_CAP - TAU1_DERATE_K * w1 ** 2
+    tightened = allowance < (u_lims[0, 1] - 1e-9)
+    slack = allowance - tau1
+    exceeds = tau1 > allowance + 1e-6  # would this run's OWN tau1 choices
+                                         # violate the derating formula?
+
+    n_tight = int(tightened.sum())
+    return {
+        "n_total": N,
+        "n_tightened": n_tight,
+        "fraction_tightened": n_tight / N if N else 0.0,
+        "min_slack_tightened": float(slack[tightened].min()) if n_tight else None,
+        "fraction_touching": float((slack[tightened] < touch_tol).mean()) if n_tight else None,
+        "n_exceeds_formula": int(exceeds.sum()),
+        "max_excess": float((tau1 - allowance)[exceeds].max()) if exceeds.any() else 0.0,
+        "allowance": allowance, "tau1": tau1, "tightened": tightened,
+    }
+
+
+def print_binding_report(report_constrained, report_unconstrained):
+    print("=== Constraint binding check: tau1 <= 28 - 0.5*w1^2 ===")
+    print("This answers 'did the system actually follow the constraint, or "
+          "did it just happen to satisfy it?' (see CLAUDE.md's 'validating "
+          "constraint satisfaction' discussion).\n")
+
+    rc = report_constrained
+    print(f"[Constrained run] Steps where this bound was tighter than the "
+          f"flat +-{TAU1_LIM:.0f} N*m limit: {rc['n_tightened']}/{rc['n_total']} "
+          f"({rc['fraction_tightened'] * 100:.0f}%)")
+    if rc["n_tightened"]:
+        print(f"  Minimum slack (bound - tau1) while tightened: "
+              f"{rc['min_slack_tightened']:.4f} N*m")
+        print(f"  Fraction of those steps within 0.05 N*m of the bound "
+              f"(genuinely touching it): {rc['fraction_touching'] * 100:.0f}%")
+        print("  -> The system is actively being held to the constraint, "
+              "not just coincidentally satisfying it.")
+    else:
+        print("  -> The constraint was NEVER tighter than the flat action "
+              "bound on this run -- it had no effect, so this run alone "
+              "does not demonstrate constraint enforcement.")
+
+    ru = report_unconstrained
+    print(f"\n[Unconstrained counterfactual] Re-solving the SAME problem "
+          f"with the constraint removed, its OWN chosen tau1 exceeds this "
+          f"same derating formula at {ru['n_exceeds_formula']}/{ru['n_total']} "
+          f"steps (by up to {ru['max_excess']:.2f} N*m).")
+    if ru["n_exceeds_formula"]:
+        print("  -> Confirms the constraint is a genuine limiter the "
+              "controller would otherwise cross, not a vacuous bound that "
+              "was never going to matter.")
+    else:
+        print("  -> The unconstrained run never would have exceeded this "
+              "bound either -- inconclusive as a counterfactual on its own.")
+    print()
 
 
 def print_report(result):
@@ -132,5 +251,11 @@ def print_report(result):
 
 
 if __name__ == "__main__":
-    result, constants = run_demo(verbose=False)
+    result, constants = run_demo(verbose=False, use_constraint=True)
     print_report(result)
+
+    u_lims = np.array([[-TAU1_LIM, TAU1_LIM], [-TAU2_LIM, TAU2_LIM]])
+    result_unconstrained, _ = run_demo(verbose=False, use_constraint=False)
+    print_binding_report(
+        binding_report(result, u_lims),
+        binding_report(result_unconstrained, u_lims))

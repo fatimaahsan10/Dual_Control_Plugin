@@ -128,6 +128,33 @@ def test_plotting_never_raises_on_malformed_result_shapes():
 
 
 # ----------------------------------------------------------------------
+# plot_actions' optional `lims` overlay (constraint binding diagnostic)
+# ----------------------------------------------------------------------
+
+def test_plot_actions_accepts_a_matching_lims_overlay():
+    config = _config_without_params()
+    report = run_solver(config)
+    assert report.ok, report.messages
+    N = report.result["u"].shape[1]
+    lims = np.tile(np.array([0.0, 5.0]), (N, 1, 1))  # (N, nu=1, 2)
+
+    fig = plot_actions(report.result, config, lims=lims)
+    assert isinstance(fig, Figure)
+
+
+def test_plot_actions_ignores_a_mismatched_or_malformed_lims():
+    """A `lims` whose shape doesn't match this result/config -- or isn't
+    even an ndarray -- must fall back to the plain plot, not raise."""
+    config = _config_without_params()
+    report = run_solver(config)
+    assert report.ok, report.messages
+
+    for bad_lims in (None, "not an array", np.zeros((3, 3)), np.full((2, 1, 2), np.nan)):
+        fig = plot_actions(report.result, config, lims=bad_lims)
+        assert isinstance(fig, Figure)
+
+
+# ----------------------------------------------------------------------
 # plot_convergence -- iLQR-only diagnostic (Plan B)
 # ----------------------------------------------------------------------
 

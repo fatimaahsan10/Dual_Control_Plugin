@@ -58,6 +58,7 @@ import pandas as pd
 import streamlit as st
 
 from wizard.codegen_preview import generate_all_previews
+from wizard.constraint_diagnostics import compute_binding_report, summarize_binding
 from wizard.equation_parser import ALLOWED_FUNCTIONS, check_equation_live
 from wizard.plotting import (
     plot_actions, plot_convergence, plot_cost, plot_parameters, plot_states,
@@ -863,13 +864,25 @@ def render_run(cfg: ModelConfig) -> None:
                 f"lambda_max' discussion in applications/"
                 f"pendulum_constrained/run_zahid_demo.py).")
 
+    binding_report = compute_binding_report(cfg, result)
+    if binding_report is not None:
+        st.subheader("Constraint binding check")
+        st.caption(
+            "A constraint the system satisfies with a lot of room to "
+            "spare hasn't really been tested -- this checks how close the "
+            "system actually came to each constraint's own boundary, "
+            "instead of just eyeballing a plot.")
+        for line in summarize_binding(binding_report):
+            st.markdown(f"- {line}")
+
     fig = plot_convergence(result)
     if fig is not None:
         st.pyplot(fig)
     fig = plot_states(result, cfg)
     if fig is not None:
         st.pyplot(fig)
-    fig = plot_actions(result, cfg)
+    fig = plot_actions(result, cfg,
+                        lims=binding_report.lims if binding_report else None)
     if fig is not None:
         st.pyplot(fig)
     fig = plot_parameters(result, cfg)
