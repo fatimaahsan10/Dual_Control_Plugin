@@ -39,3 +39,8 @@ desktop.ini
 
 # Logs
 *.log
+
+# Personal notes (not for public repo)
+NOTES/Literature review.xlsx
+NOTES/Meetings-Mitacs.xlsx
+NOTES/Conference_Paper_Draft.md
